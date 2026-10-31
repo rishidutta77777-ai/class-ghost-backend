@@ -27,89 +27,85 @@ class StopRequest(BaseModel):
 
 async def run_bot_lifecycle(session_id: str, url: str, name: str):
     async with async_playwright() as p:
-        # Launch Chromium with stealth flags and media bypasses
         browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--use-fake-ui-for-media-stream",
                 "--use-fake-device-for-media-stream",
+                "--enable-usermedia-screen-capturing",
+                "--allow-http-screen-capture",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-web-security"
             ]
         )
         
+        # Emulate a current Chrome browser with full client hints
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             permissions=["microphone", "camera"],
-            viewport={"width": 1280, "height": 720}
+            viewport={"width": 1280, "height": 720},
+            extra_http_headers={
+                "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"'
+            }
         )
         
         page = await context.new_page()
-        # Wipe the navigator.webdriver detection flag
-        await page.add_init_script("delete Object.getPrototypeOf(navigator).webdriver")
+        
+        # Patch bot markers
+        await page.add_init_script("""
+            delete Object.getPrototypeOf(navigator).webdriver;
+            window.navigator.chrome = { runtime: {} };
+        """)
         
         sessions[session_id] = {"browser": browser, "page": page, "status": "running"}
 
         try:
-            print(f"[{session_id}] Navigating to: {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(5)
+            print(f"[{session_id}] Connecting to {url}...")
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(4)
 
-            # Snapshot the initial landing screen
             await page.screenshot(path="last_view.png")
-            print(f"[{session_id}] Landed on: {page.url}")
 
-            # Check for Google sign-in redirect
-            if "accounts.google.com" in page.url:
-                print(f"[{session_id}] Blocked by Google sign-in wall.")
-                sessions[session_id]["status"] = "blocked_login_required"
-                return
-
-            # Dismiss common Google modals/popups
+            # Dismiss common popups/banners
             for text in ["Got it", "Dismiss", "I agree", "Accept all", "Continue without microphone"]:
                 btn = page.locator(f'button:has-text("{text}")')
                 if await btn.count() > 0:
                     try:
-                        await btn.first.click(timeout=2000)
+                        await btn.first.click(timeout=1500)
                     except Exception:
                         pass
 
-            # Turn off mic & camera using Meet keyboard shortcuts
+            # Turn off mic & camera
             await page.keyboard.press("Control+d")
             await page.keyboard.press("Control+e")
             await asyncio.sleep(1)
 
-            # Locate and fill the display name field
+            # Fill name if prompt is visible
             name_input = page.locator('input[aria-label="Your name"], input[placeholder="Your name"], input[type="text"]')
             if await name_input.count() > 0:
-                print(f"[{session_id}] Entering name: {name}")
+                print(f"[{session_id}] Filling name: {name}")
                 await name_input.first.click()
                 await name_input.first.fill(name)
                 await asyncio.sleep(1)
 
-            # Capture snapshot after filling name
-            await page.screenshot(path="last_view.png")
-
-            # Click the join button
+            # Click Join / Ask to join
             join_btn = page.locator('button:has-text("Ask to join"), button:has-text("Join now")')
             if await join_btn.count() > 0:
-                print(f"[{session_id}] Clicking join button...")
+                print(f"[{session_id}] Clicking join...")
                 await join_btn.first.click()
-            else:
-                print(f"[{session_id}] Join button not found.")
-
-            await asyncio.sleep(5)
-            # Final snapshot showing current lobby or in-call state
+            
+            await asyncio.sleep(4)
             await page.screenshot(path="last_view.png")
 
-            # Keep process running until dismissed or disconnected
             while session_id in sessions and sessions[session_id]["status"] == "running":
                 await asyncio.sleep(5)
 
         except Exception as e:
-            print(f"[{session_id}] Error: {e}")
+            print(f"[{session_id}] Session failed: {e}")
         finally:
             await browser.close()
             if session_id in sessions:
