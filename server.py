@@ -30,7 +30,7 @@ class StopRequest(BaseModel):
 
 async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: List[Dict[str, Any]]):
     async with async_playwright() as p:
-        # Launch Chromium with zero camera/mic capture devices and minimal memory
+        # Strict low-memory flags tailored for 512MB RAM Linux instances
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -49,26 +49,17 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
                 "--disable-2d-canvas-clip-aa",
                 "--disable-gl-drawing-for-tests",
                 "--renderer-process-limit=1",
-                "--js-flags=--max-old-space-size=128"
+                "--js-flags=--max-old-space-size=96"
             ]
         )
         
-        # Grant NO camera or mic permissions - keeps hardware encoders completely offline
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             permissions=[],
-            viewport={"width": 800, "height": 600},
+            viewport={"width": 640, "height": 480},
             color_scheme="dark",
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
         )
-
-        # Block extraneous static assets
-        async def block_heavy_resources(route):
-            req = route.request
-            if req.resource_type in ["image", "media", "font"]:
-                await route.abort()
-            else:
-                await route.continue_()
 
         # Sanitize and inject cookies
         clean_cookies = []
@@ -116,23 +107,30 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
 
         page = await context.new_page()
 
-        # Stealth patches
+        # Stealth property patch
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
         """)
 
+        # Block extraneous static images and fonts
+        async def block_heavy_resources(route):
+            req = route.request
+            if req.resource_type in ["image", "font"]:
+                await route.abort()
+            else:
+                await route.continue_()
+
         await page.route("**/*", block_heavy_resources)
         sessions[session_id] = {"browser": browser, "page": page, "status": "running"}
 
         try:
-            print(f"[{session_id}] Connecting to meeting...")
+            print(f"[{session_id}] Navigating to meeting URL...")
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
             # Wait and interact with the lobby
             joined = False
             for _ in range(25):
-                # Dismiss modals and alerts
                 for text in ["Got it", "Dismiss", "I agree", "Accept all", "Continue without microphone", "Continue without camera"]:
                     btn = page.locator(f'button:has-text("{text}")')
                     if await btn.count() > 0:
@@ -141,7 +139,6 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
                         except Exception:
                             pass
 
-                # Locate join buttons
                 join_targets = [
                     'button:has-text("Ask to join")',
                     'button:has-text("Join now")',
@@ -154,7 +151,7 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
                     btn = page.locator(selector)
                     if await btn.count() > 0:
                         if await btn.first.is_visible() and await btn.first.is_enabled():
-                            print(f"[{session_id}] Clicking join: {selector}")
+                            print(f"[{session_id}] Clicking join button...")
                             await btn.first.click()
                             joined = True
                             break
@@ -164,45 +161,51 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
 
                 await asyncio.sleep(2)
 
-            # Wait 8s for admission into meeting room
-            await asyncio.sleep(8)
+            # Allow time to enter call
+            await asyncio.sleep(10)
 
-            # Mute incoming audio and disable rendering inside DOM to protect RAM
+            # Sever incoming WebRTC streams directly inside the browser memory
             try:
                 await page.evaluate("""
                     () => {
+                        // Mute and pause all existing audio/video elements
                         document.querySelectorAll('audio, video').forEach(el => {
                             el.muted = true;
                             el.pause();
-                            el.srcObject = null;
+                            if (el.srcObject) {
+                                el.srcObject.getTracks().forEach(track => track.stop());
+                                el.srcObject = null;
+                            }
                         });
+
+                        // Disable receiving incoming video/audio on all peer connections
+                        if (window.RTCPeerConnection) {
+                            const origAddTrack = RTCPeerConnection.prototype.addTrack;
+                            RTCPeerConnection.prototype.addTrack = function() {
+                                return null;
+                            };
+                        }
                     }
                 """)
             except Exception:
                 pass
 
-            # Capture single entry confirmation screenshot
+            # One-time entry screenshot confirmation
             try:
                 await page.screenshot(path="last_view.png")
             except Exception:
                 pass
 
+            # Trigger memory cleanup
             gc.collect()
 
-            # Ultralight idle loop: keeps session active without consuming CPU/RAM
+            # Lightweight idle loop - minimal sleep without continuous screenshot generation
             while session_id in sessions and sessions[session_id]["status"] == "running":
-                try:
-                    evicted = await page.locator('text="You left the meeting", text="You were removed"').count()
-                    if evicted > 0:
-                        print(f"[{session_id}] Meeting ended or bot removed.")
-                        break
-                except Exception:
-                    pass
-
-                await asyncio.sleep(20)
+                await asyncio.sleep(30)
+                gc.collect()
 
         except Exception as e:
-            print(f"[{session_id}] Session encountered error: {e}")
+            print(f"[{session_id}] Runtime error: {e}")
         finally:
             await browser.close()
             if session_id in sessions:
