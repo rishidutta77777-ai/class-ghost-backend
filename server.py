@@ -30,16 +30,23 @@ class StopRequest(BaseModel):
 
 async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: List[Dict[str, Any]]):
     async with async_playwright() as p:
+        # Chromium flags tailored for Render's 512MB RAM Linux container
         browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
                 "--disable-blink-features=AutomationControlled",
                 "--use-fake-ui-for-media-stream",
                 "--use-fake-device-for-media-stream",
-                "--disable-gpu"
+                "--mute-audio",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-features=AudioServiceSandbox,TranslateUI",
+                "--js-flags=--max-old-space-size=256"
             ]
         )
         
@@ -51,8 +58,8 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
         )
 
-        # Sanitize and inject cookies one-by-one so Chromium accepts them without error
-        injected_count = 0
+        # Inject session cookies
+        clean_cookies = []
         for c in user_cookies:
             try:
                 name_val = str(c.get("name", "")).strip()
@@ -63,44 +70,41 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
                 raw_domain = str(c.get("domain", ".google.com")).strip()
                 clean_domain = raw_domain if raw_domain.startswith(".") else f".{raw_domain}"
 
-                cookie_entry = {
+                entry = {
                     "name": name_val,
                     "value": val,
                     "domain": clean_domain,
-                    "path": str(c.get("path", "/"))
+                    "path": str(c.get("path", "/")),
+                    "secure": True
                 }
-
-                # Force secure=True for all Google session tokens
-                is_secure = c.get("secure", False)
-                if name_val.startswith("__Secure-") or name_val.startswith("__Host-") or "google" in clean_domain:
-                    is_secure = True
-                cookie_entry["secure"] = is_secure
-
-                if "httpOnly" in c:
-                    cookie_entry["httpOnly"] = bool(c["httpOnly"])
 
                 same_site = c.get("sameSite")
                 if isinstance(same_site, str):
                     s_lower = same_site.lower()
                     if s_lower in ["none", "no_restriction"]:
-                        cookie_entry["sameSite"] = "None"
-                        cookie_entry["secure"] = True
+                        entry["sameSite"] = "None"
                     elif s_lower == "lax":
-                        cookie_entry["sameSite"] = "Lax"
+                        entry["sameSite"] = "Lax"
                     elif s_lower == "strict":
-                        cookie_entry["sameSite"] = "Strict"
+                        entry["sameSite"] = "Strict"
 
-                await context.add_cookies([cookie_entry])
-                injected_count += 1
+                clean_cookies.append(entry)
             except Exception:
                 continue
 
-        print(f"[{session_id}] Injected {injected_count} cookies into session.")
-        del user_cookies
-        gc.collect()
+        try:
+            await context.add_cookies(clean_cookies)
+            print(f"[{session_id}] Injected {len(clean_cookies)} cookies.")
+        except Exception as e:
+            print(f"[{session_id}] Cookie loading issue: {e}")
+        finally:
+            del user_cookies
+            del clean_cookies
+            gc.collect()
 
         page = await context.new_page()
 
+        # Stealth patches
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
@@ -109,34 +113,49 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
         sessions[session_id] = {"browser": browser, "page": page, "status": "running"}
 
         try:
-            print(f"[{session_id}] Loading meeting URL...")
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            print(f"[{session_id}] Opening {url}...")
+            await page.goto(url, wait_until="networkidle", timeout=45000)
 
-            # Continuously dismiss blocking modals while waiting for lobby to ready
-            for _ in range(40):
+            # Wait and interact with the lobby
+            joined = False
+            for attempt in range(25):
                 await page.screenshot(path="last_view.png")
 
-                # Dismiss common Google popups/overlays
+                # Clear blocking prompt dialogs
                 for text in ["Got it", "Dismiss", "I agree", "Accept all", "Continue without microphone"]:
-                    btn = page.locator(f'button:has-text("{text}")')
-                    if await btn.count() > 0:
+                    dismiss_btn = page.locator(f'button:has-text("{text}")')
+                    if await dismiss_btn.count() > 0:
                         try:
-                            await btn.first.click(timeout=1000)
+                            await dismiss_btn.first.click(timeout=800)
                         except Exception:
                             pass
 
-                # Mute mic and cam
+                # Mute mic and camera via hotkeys
                 try:
                     await page.keyboard.press("Control+d")
                     await page.keyboard.press("Control+e")
                 except Exception:
                     pass
 
-                # Check if Join or Ask to Join is available
-                join_btn = page.locator('button:has-text("Ask to join"), button:has-text("Join now"), button[aria-label*="Ask to join"]')
-                if await join_btn.count() > 0:
-                    print(f"[{session_id}] Join button found! Clicking...")
-                    await join_btn.first.click()
+                # Locate the join button variants
+                join_targets = [
+                    'button:has-text("Ask to join")',
+                    'button:has-text("Join now")',
+                    'button[aria-label*="Ask to join"]',
+                    'button[aria-label*="Join now"]',
+                    '[data-mdc-dialog-action="join"]'
+                ]
+
+                for selector in join_targets:
+                    btn = page.locator(selector)
+                    if await btn.count() > 0:
+                        if await btn.first.is_visible() and await btn.first.is_enabled():
+                            print(f"[{session_id}] Clicking join button: {selector}")
+                            await btn.first.click()
+                            joined = True
+                            break
+
+                if joined:
                     break
 
                 await asyncio.sleep(2)
@@ -144,16 +163,16 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
             await asyncio.sleep(5)
             await page.screenshot(path="last_view.png")
 
-            # Meeting monitor loop
+            # In-meeting keep-alive loop
             while session_id in sessions and sessions[session_id]["status"] == "running":
                 await page.screenshot(path="last_view.png")
-                # Detect actual end of meeting or eviction
+                # Exit if kicked or ended
                 if await page.locator('text="You left the meeting", text="You were removed"').count() > 0:
                     break
-                await asyncio.sleep(8)
+                await asyncio.sleep(10)
 
         except Exception as e:
-            print(f"[{session_id}] Encountered runtime error: {e}")
+            print(f"[{session_id}] Runtime error: {e}")
         finally:
             await browser.close()
             if session_id in sessions:
