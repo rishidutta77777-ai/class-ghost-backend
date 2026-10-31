@@ -30,7 +30,7 @@ class StopRequest(BaseModel):
 
 async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: List[Dict[str, Any]]):
     async with async_playwright() as p:
-        # Chromium flags tailored for Render's 512MB RAM Linux container
+        # Strict memory caps tailored for Render's 512MB RAM ceiling
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -45,20 +45,33 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
                 "--mute-audio",
                 "--no-first-run",
                 "--no-default-browser-check",
-                "--disable-features=AudioServiceSandbox,TranslateUI",
-                "--js-flags=--max-old-space-size=256"
+                "--disable-features=AudioServiceSandbox,TranslateUI,WebRtcHideLocalIpsWithMdns",
+                "--disable-canvas-aa",
+                "--disable-2d-canvas-clip-aa",
+                "--disable-gl-drawing-for-tests",
+                "--renderer-process-limit=1",
+                "--js-flags=--max-old-space-size=128"
             ]
         )
         
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             permissions=["microphone", "camera"],
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 800, "height": 600},
             color_scheme="dark",
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
         )
 
-        # Inject session cookies
+        # Block media heavy requests (remote video feeds/fonts/images) to prevent OOM
+        async def block_heavy_resources(route):
+            req = route.request
+            resource_type = req.resource_type
+            if resource_type in ["image", "media", "font"]:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        # Sanitize and inject cookies
         clean_cookies = []
         for c in user_cookies:
             try:
@@ -96,7 +109,7 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
             await context.add_cookies(clean_cookies)
             print(f"[{session_id}] Injected {len(clean_cookies)} cookies.")
         except Exception as e:
-            print(f"[{session_id}] Cookie loading issue: {e}")
+            print(f"[{session_id}] Cookie injection error: {e}")
         finally:
             del user_cookies
             del clean_cookies
@@ -104,40 +117,41 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
 
         page = await context.new_page()
 
-        # Stealth patches
+        # Stealth property patch
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
         """)
 
+        # Apply resource blocker to keep memory low
+        await page.route("**/*", block_heavy_resources)
+
         sessions[session_id] = {"browser": browser, "page": page, "status": "running"}
 
         try:
             print(f"[{session_id}] Opening {url}...")
-            await page.goto(url, wait_until="networkidle", timeout=45000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-            # Wait and interact with the lobby
+            # Wait and handle the lobby screen
             joined = False
             for attempt in range(25):
-                await page.screenshot(path="last_view.png")
-
-                # Clear blocking prompt dialogs
+                # Dismiss popups
                 for text in ["Got it", "Dismiss", "I agree", "Accept all", "Continue without microphone"]:
-                    dismiss_btn = page.locator(f'button:has-text("{text}")')
-                    if await dismiss_btn.count() > 0:
+                    btn = page.locator(f'button:has-text("{text}")')
+                    if await btn.count() > 0:
                         try:
-                            await dismiss_btn.first.click(timeout=800)
+                            await btn.first.click(timeout=800)
                         except Exception:
                             pass
 
-                # Mute mic and camera via hotkeys
+                # Mute mic and camera
                 try:
                     await page.keyboard.press("Control+d")
                     await page.keyboard.press("Control+e")
                 except Exception:
                     pass
 
-                # Locate the join button variants
+                # Locate join buttons
                 join_targets = [
                     'button:has-text("Ask to join")',
                     'button:has-text("Join now")',
@@ -150,7 +164,7 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
                     btn = page.locator(selector)
                     if await btn.count() > 0:
                         if await btn.first.is_visible() and await btn.first.is_enabled():
-                            print(f"[{session_id}] Clicking join button: {selector}")
+                            print(f"[{session_id}] Clicking join button...")
                             await btn.first.click()
                             joined = True
                             break
@@ -160,16 +174,29 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
 
                 await asyncio.sleep(2)
 
-            await asyncio.sleep(5)
-            await page.screenshot(path="last_view.png")
-
-            # In-meeting keep-alive loop
-            while session_id in sessions and sessions[session_id]["status"] == "running":
+            # Allow time to enter call and take a single confirmation screenshot
+            await asyncio.sleep(6)
+            try:
                 await page.screenshot(path="last_view.png")
-                # Exit if kicked or ended
-                if await page.locator('text="You left the meeting", text="You were removed"').count() > 0:
-                    break
-                await asyncio.sleep(10)
+            except Exception:
+                pass
+
+            # Force garbage collection to free memory
+            gc.collect()
+
+            # Lightweight idle loop (avoids periodic screenshots to prevent memory spikes)
+            while session_id in sessions and sessions[session_id]["status"] == "running":
+                # Check eviction markers without heavy DOM querying
+                try:
+                    evicted = await page.locator('text="You left the meeting", text="You were removed"').count()
+                    if evicted > 0:
+                        print(f"[{session_id}] Evicted or meeting ended.")
+                        break
+                except Exception:
+                    pass
+
+                # Sleep 15 seconds between light health checks
+                await asyncio.sleep(15)
 
         except Exception as e:
             print(f"[{session_id}] Runtime error: {e}")
@@ -177,6 +204,7 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
             await browser.close()
             if session_id in sessions:
                 sessions[session_id]["status"] = "ended"
+            gc.collect()
 
 @app.get("/view")
 async def view_screen():
