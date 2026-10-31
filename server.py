@@ -1,11 +1,12 @@
 import asyncio
 import os
 import uuid
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, BackgroundTasks
+import gc
+from typing import List, Dict, Any
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright
 
 app = FastAPI()
@@ -21,13 +22,14 @@ sessions = {}
 
 class MeetingRequest(BaseModel):
     url: str
-    name: str
-    cookies: Optional[List[Dict[str, Any]]] = None
+    name: str = "Authenticated Bot"
+    # Cookies are mandatory and must be a non-empty list
+    cookies: List[Dict[str, Any]] = Field(..., min_items=1)
 
 class StopRequest(BaseModel):
     session_id: str
 
-async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: Optional[List[Dict[str, Any]]] = None):
+async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: List[Dict[str, Any]]):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -49,28 +51,34 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
         )
 
-        # Inject user-specific cookies if provided
-        if user_cookies:
-            clean_cookies = []
-            for c in user_cookies:
-                cookie_entry = {
-                    "name": c.get("name"),
-                    "value": c.get("value"),
-                    "domain": c.get("domain", ".google.com"),
-                    "path": c.get("path", "/")
-                }
-                if "sameSite" in c and c["sameSite"] in ["Strict", "Lax", "None"]:
-                    cookie_entry["sameSite"] = c["sameSite"]
-                clean_cookies.append(cookie_entry)
-            try:
-                await context.add_cookies(clean_cookies)
-                print(f"[{session_id}] Injected {len(clean_cookies)} user cookies.")
-            except Exception as e:
-                print(f"[{session_id}] Cookie injection error: {e}")
+        # Sanitize and format cookies into memory
+        clean_cookies = []
+        for c in user_cookies:
+            cookie_entry = {
+                "name": str(c.get("name")),
+                "value": str(c.get("value")),
+                "domain": str(c.get("domain", ".google.com")),
+                "path": str(c.get("path", "/"))
+            }
+            if "sameSite" in c and c["sameSite"] in ["Strict", "Lax", "None"]:
+                cookie_entry["sameSite"] = c["sameSite"]
+            clean_cookies.append(cookie_entry)
+
+        # Inject into ephemeral browser memory
+        try:
+            await context.add_cookies(clean_cookies)
+            print(f"[{session_id}] Injected {len(clean_cookies)} session cookies successfully.")
+        except Exception as e:
+            print(f"[{session_id}] Cookie injection error: {e}")
+        finally:
+            # Wipe plain references from RAM immediately
+            del user_cookies
+            del clean_cookies
+            gc.collect()
 
         page = await context.new_page()
 
-        # Mask automation indicators
+        # Stealth property patches
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
@@ -79,20 +87,17 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
         sessions[session_id] = {"browser": browser, "page": page, "status": "running"}
 
         try:
-            print(f"[{session_id}] Connecting to {url}...")
+            print(f"[{session_id}] Navigating to {url}...")
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-            # Wait for lobby/pre-call interface
+            # Wait for lobby elements
             for _ in range(12):
                 await page.screenshot(path="last_view.png")
-                if await page.locator('text="You can\'t join this video call"').count() > 0:
-                    print(f"[{session_id}] Blocked: Meeting requires Google sign-in.")
-                    return
-                if await page.locator('input[type="text"], button:has-text("Ask to join"), button:has-text("Join now")').count() > 0:
+                if await page.locator('button:has-text("Ask to join"), button:has-text("Join now")').count() > 0:
                     break
                 await asyncio.sleep(2)
 
-            # Dismiss pre-join permission modals
+            # Dismiss common Google modals
             for text in ["Got it", "Dismiss", "I agree", "Accept all", "Continue without microphone"]:
                 btn = page.locator(f'button:has-text("{text}")')
                 if await btn.count() > 0:
@@ -101,7 +106,7 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
                     except Exception:
                         pass
 
-            # Mute microphone and camera
+            # Mute microphone and camera shortcuts
             try:
                 await page.keyboard.press("Control+d")
                 await page.keyboard.press("Control+e")
@@ -109,34 +114,25 @@ async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: 
                 pass
             await asyncio.sleep(1)
 
-            # Guest Name Field (Only appears if no cookies / guest mode)
-            name_input = page.locator('input[aria-label="Your name"], input[placeholder="Your name"], input[type="text"]')
-            if await name_input.count() > 0:
-                print(f"[{session_id}] Typing guest name: {name}")
-                await name_input.first.click()
-                await name_input.first.fill(name)
-                await asyncio.sleep(1)
-
-            await page.screenshot(path="last_view.png")
-
-            # Click Join / Ask to join
+            # Click Join / Ask to Join
             join_btn = page.locator('button:has-text("Ask to join"), button:has-text("Join now"), button[aria-label*="Ask to join"]')
             if await join_btn.count() > 0:
-                print(f"[{session_id}] Clicking join...")
+                print(f"[{session_id}] Clicking Join button...")
                 await join_btn.first.click()
             else:
-                print(f"[{session_id}] Join button not located.")
+                print(f"[{session_id}] Join button not ready or not found.")
 
             await asyncio.sleep(4)
             await page.screenshot(path="last_view.png")
 
+            # Maintain active call loop
             while session_id in sessions and sessions[session_id]["status"] == "running":
                 if await page.locator('text="You left the meeting", text="You can\'t join this video call"').count() > 0:
                     break
                 await asyncio.sleep(5)
 
         except Exception as e:
-            print(f"[{session_id}] Error: {e}")
+            print(f"[{session_id}] Session encountered error: {e}")
         finally:
             await browser.close()
             if session_id in sessions:
@@ -150,6 +146,9 @@ async def view_screen():
 
 @app.post("/start")
 async def start_session(req: MeetingRequest, background_tasks: BackgroundTasks):
+    if not req.cookies:
+        raise HTTPException(status_code=400, detail="Google session cookies are mandatory.")
+    
     session_id = str(uuid.uuid4())
     sessions[session_id] = {"status": "starting"}
     background_tasks.add_task(run_bot_lifecycle, session_id, req.url, req.name, req.cookies)
