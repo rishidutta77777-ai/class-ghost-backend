@@ -1,6 +1,8 @@
+
 #!/usr/bin/env bash
 set -o errexit
 
+export PLAYWRIGHT_BROWSERS_PATH=0
 pip install --upgrade pip
 pip install -r requirements.txt
 playwright install chromium
