@@ -1,3 +1,5 @@
-fastapi
-uvicorn
-playwright
+flask==3.0.3
+flask-cors==4.0.1
+gunicorn==22.0.0
+playwright==1.48.0
+playwright-stealth==1.0.6
