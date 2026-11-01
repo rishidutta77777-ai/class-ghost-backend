@@ -1,28 +1,32 @@
 import os
 import gc
+import json
 import asyncio
 import threading
+import subprocess
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
+# Force Playwright to keep Chromium inside the project folder so Render never wipes it
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+
 app = Flask(__name__)
 CORS(app)
 
-# Global Bot State (Strictly 1 browser instance allowed to protect 512MB RAM)
 BOT_STATE = {
     "status": "idle",       # idle | starting | in_class | leaving | error
     "message": "Ready to deploy.",
     "participants": 0,
     "meet_url": "",
     "student_name": "",
+    "auth_mode": "guest",
     "stop_requested": False
 }
 
 STATE_LOCK = threading.Lock()
 
-# Spoofs real Windows Laptop Hardware & strips automation flags
 STEALTH_PATCH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
@@ -39,70 +43,123 @@ WebGLRenderingContext.prototype.getParameter = function(param) {
 """
 
 def make_anti_spoof_name(raw_name: str) -> str:
-    """
-    Inserts an invisible Unicode Zero-Width Non-Joiner (\u200c) inside the name.
-    To human eyes on the teacher's screen it reads identically,
-    but it prevents Google Meet from matching the string against the host's
-    Google Contacts and triggering the 'With potential risks' impersonation warning.
-    """
     clean = raw_name.strip()
     if len(clean) > 2:
         return clean[:2] + "\u200c" + clean[2:]
     return clean
 
-async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_participants: int):
+def parse_cookies_input(raw_json_str: str):
+    """
+    Supports both:
+    1. Playwright storage_state JSON: {"cookies": [...], "origins": [...]}
+    2. Browser Cookie-Editor extension JSON array: [{"name": "SID", "value": "...", ...}]
+    """
+    if not raw_json_str or not raw_json_str.strip():
+        return None, None
+
+    data = json.loads(raw_json_str.strip())
+    if isinstance(data, dict) and "cookies" in data:
+        with open("auth.json", "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return "storage_state", "auth.json"
+    elif isinstance(data, list):
+        # Convert Cookie-Editor array to Playwright compatible cookies
+        pw_cookies = []
+        for c in data:
+            if "name" in c and "value" in c and "domain" in c:
+                cookie_item = {
+                    "name": c["name"],
+                    "value": c["value"],
+                    "domain": c["domain"],
+                    "path": c.get("path", "/"),
+                    "secure": bool(c.get("secure", True)),
+                    "httpOnly": bool(c.get("httpOnly", False)),
+                    "sameSite": "None" if str(c.get("sameSite", "")).lower() in ["no_restriction", "none"] else "Lax"
+                }
+                pw_cookies.append(cookie_item)
+        return "cookie_list", pw_cookies
+    return None, None
+
+async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_participants: int, custom_cookies_str: str):
     with STATE_LOCK:
         BOT_STATE["status"] = "starting"
-        BOT_STATE["message"] = "Booting ultra-low-RAM stealth browser..."
+        BOT_STATE["message"] = "Preparing stealth browser..."
         BOT_STATE["participants"] = 0
         BOT_STATE["stop_requested"] = False
 
     safe_name = make_anti_spoof_name(raw_name)
+    auth_env = custom_cookies_str.strip() or os.environ.get("GOOGLE_AUTH_STATE", "").strip()
+    auth_type, auth_payload = None, None
+
+    if auth_env:
+        try:
+            auth_type, auth_payload = parse_cookies_input(auth_env)
+            with STATE_LOCK:
+                BOT_STATE["auth_mode"] = "google_authenticated" if auth_type else "guest"
+        except Exception as e:
+            print(f"[!] Cookie parse warning: {e}")
+
     browser = None
     context = None
 
     try:
         async with async_playwright() as p:
-            # Launch Chromium using '--headless=new' (True Chrome engine without Xvfb RAM overhead)
-            # Tuned specifically for 512MB RAM & 0.1 CPU cloud containers
-            browser = await p.chromium.launch(
-                headless=True,
-                ignore_default_args=["--enable-automation"],
-                args=[
-                    "--headless=new",
-                    "--disable-blink-features=AutomationControlled",
-                    "--use-fake-ui-for-media-stream",
-                    "--use-fake-device-for-media-stream",
-                    "--mute-audio",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-sync",
-                    "--disable-translate",
-                    "--no-first-run",
-                    "--renderer-process-limit=1",
-                    "--js-flags=--max-old-space-size=192",
-                    "--window-size=1280,720"
-                ]
-            )
+            launch_args = [
+                "--headless=new",
+                "--disable-blink-features=AutomationControlled",
+                "--use-fake-ui-for-media-stream",
+                "--use-fake-device-for-media-stream",
+                "--mute-audio",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--renderer-process-limit=1",
+                "--js-flags=--max-old-space-size=192",
+                "--window-size=1280,720"
+            ]
 
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 720},
-                locale="en-IN",
-                timezone_id="Asia/Kolkata",
-                permissions=["microphone", "camera"]
-            )
+            try:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    ignore_default_args=["--enable-automation"],
+                    args=launch_args
+                )
+            except Exception as launch_err:
+                if "Executable doesn't exist" in str(launch_err):
+                    with STATE_LOCK:
+                        BOT_STATE["message"] = "Installing Chromium binary (one-time ~40s setup)..."
+                    subprocess.run(["playwright", "install", "chromium"], check=True)
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        ignore_default_args=["--enable-automation"],
+                        args=launch_args
+                    )
+                else:
+                    raise launch_err
+
+            context_kwargs = {
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "viewport": {"width": 1280, "height": 720},
+                "locale": "en-IN",
+                "timezone_id": "Asia/Kolkata",
+                "permissions": ["microphone", "camera"]
+            }
+
+            if auth_type == "storage_state":
+                context_kwargs["storage_state"] = auth_payload
+
+            context = await browser.new_context(**context_kwargs)
+            if auth_type == "cookie_list" and auth_payload:
+                await context.add_cookies(auth_payload)
 
             await context.add_init_script(STEALTH_PATCH_JS)
             page = await context.new_page()
             await stealth_async(page)
 
-            # Block heavy fonts & non-essential images to save ~120MB RAM and 0.1 CPU cycles
             async def block_heavy_assets(route):
                 if route.request.resource_type in ["font", "media"]:
                     await route.abort()
@@ -112,9 +169,9 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
             await page.route("**/*", block_heavy_assets)
 
             with STATE_LOCK:
-                BOT_STATE["message"] = "Opening Google Meet lobby..."
+                mode_label = "Authenticated Google Account" if auth_type else "Stealth Guest Mode"
+                BOT_STATE["message"] = f"Opening Meet ({mode_label})..."
 
-            # Extended timeout (90s) because 0.1 CPU throttles TLS handshakes and JS parsing
             await page.goto(meet_url, wait_until="domcontentloaded", timeout=90000)
             await asyncio.sleep(10)
 
@@ -124,7 +181,6 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
             await page.keyboard.press("Control+e")
             await asyncio.sleep(2)
 
-            # Dismiss any 'Continue without microphone/camera' popups if shown
             for dismiss_text in ["Continue without microphone and camera", "Got it", "Dismiss"]:
                 try:
                     d_btn = page.locator(f"button:has-text('{dismiss_text}')").first
@@ -134,24 +190,23 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                 except Exception:
                     pass
 
-            # Type Custom Name with human keystroke pacing
-            with STATE_LOCK:
-                BOT_STATE["message"] = f"Entering name: {raw_name}..."
-
+            # Only type custom name if the lobby asks for one (unauthenticated guest)
             try:
                 name_input = page.locator("input[type='text'], input[aria-label*='name' i]").first
-                await name_input.wait_for(state="visible", timeout=15000)
-                await name_input.click()
-                await asyncio.sleep(0.5)
-                await name_input.fill("")
-                await name_input.type(safe_name, delay=90)
-                await asyncio.sleep(1.5)
-            except Exception as e:
-                print(f"[!] Name input note: {e}")
+                if await name_input.is_visible():
+                    with STATE_LOCK:
+                        BOT_STATE["message"] = f"Typing display name: {raw_name}..."
+                    await name_input.click()
+                    await asyncio.sleep(0.5)
+                    await name_input.fill("")
+                    await name_input.type(safe_name, delay=90)
+                    await asyncio.sleep(1.5)
+            except Exception:
+                pass
 
-            # Click 'Ask to join' or 'Join now'
+            # Click 'Join now' or 'Ask to join'
             joined_clicked = False
-            for btn_label in ["Ask to join", "Join now", "Switch here"]:
+            for btn_label in ["Join now", "Ask to join", "Switch here"]:
                 try:
                     btn = page.locator(f"button:has-text('{btn_label}')").first
                     if await btn.is_visible():
@@ -169,9 +224,8 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
 
             with STATE_LOCK:
                 BOT_STATE["status"] = "in_class"
-                BOT_STATE["message"] = "Knocking / Sitting in class (Cam & Mic OFF)."
+                BOT_STATE["message"] = "In Class / Waiting Room (Mic & Cam OFF)."
 
-            # Main monitoring loop (Checks every 10s for stop signal, teacher ending call, or student drop)
             elapsed = 0
             max_seconds = max_minutes * 60
             peak_participants = 0
@@ -186,7 +240,6 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                 await asyncio.sleep(10)
                 elapsed += 10
 
-                # Check if meeting ended or bot was removed
                 try:
                     body_text = await page.inner_text("body")
                     if any(phrase in body_text for phrase in [
@@ -198,12 +251,11 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                         "denied your request"
                     ]):
                         with STATE_LOCK:
-                            BOT_STATE["message"] = "Session ended by teacher/host. Left automatically."
+                            BOT_STATE["message"] = "Session ended by teacher. Left automatically."
                         break
                 except Exception:
                     pass
 
-                # Check live participant counter for auto-leave
                 try:
                     badge = page.locator("div.uGOf1d").first
                     if await badge.is_visible():
@@ -225,7 +277,7 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
     except Exception as e:
         with STATE_LOCK:
             BOT_STATE["status"] = "error"
-            BOT_STATE["message"] = f"Bot error: {str(e)[:120]}"
+            BOT_STATE["message"] = f"Bot error: {str(e)[:140]}"
     finally:
         try:
             if context:
@@ -234,17 +286,17 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                 await browser.close()
         except Exception:
             pass
-        gc.collect()  # Force free RAM immediately on 512MB container
+        gc.collect()
         with STATE_LOCK:
             if BOT_STATE["status"] != "error":
                 BOT_STATE["status"] = "idle"
             BOT_STATE["participants"] = 0
             BOT_STATE["stop_requested"] = False
 
-def run_async_bot(meet_url, student_name, max_minutes, min_participants):
+def run_async_bot(meet_url, student_name, max_minutes, min_participants, custom_cookies):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(meet_bot_worker(meet_url, student_name, max_minutes, min_participants))
+    loop.run_until_complete(meet_bot_worker(meet_url, student_name, max_minutes, min_participants, custom_cookies))
     loop.close()
 
 @app.route("/", methods=["GET"])
@@ -261,21 +313,22 @@ def join_meeting():
     data = request.get_json(silent=True) or request.args
     meet_url = (data.get("meet_url") or data.get("url") or "").strip()
     student_name = (data.get("student_name") or data.get("name") or "Hrishikesh Dutta").strip()
-    max_minutes = int(data.get("max_duration") or data.get("duration") or 50)
+    max_minutes = int(data.get("max_duration") or data.get("duration") or 125)
     min_participants = int(data.get("min_participants") or 5)
+    custom_cookies = (data.get("google_cookies") or "").strip()
 
     if not meet_url or "meet.google.com" not in meet_url:
         return jsonify({"ok": False, "error": "Please provide a valid Google Meet link."}), 400
 
     with STATE_LOCK:
         if BOT_STATE["status"] in ["starting", "in_class"]:
-            return jsonify({"ok": False, "error": "A bot is already active in a class. Tap Leave first."}), 409
+            return jsonify({"ok": False, "error": "A bot is already active. Tap Leave first."}), 409
         BOT_STATE["meet_url"] = meet_url
         BOT_STATE["student_name"] = student_name
 
     thread = threading.Thread(
         target=run_async_bot,
-        args=(meet_url, student_name, max_minutes, min_participants),
+        args=(meet_url, student_name, max_minutes, min_participants, custom_cookies),
         daemon=True
     )
     thread.start()
@@ -293,5 +346,4 @@ def leave_meeting():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    # Single worker + threaded mode prevents Gunicorn/Flask from multiplying RAM usage
     app.run(host="0.0.0.0", port=port, threaded=True)
