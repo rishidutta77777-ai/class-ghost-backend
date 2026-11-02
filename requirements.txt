@@ -1,6 +1,5 @@
-flask==3.0.3
-flask-cors==4.0.1
-gunicorn==22.0.0
-greenlet>=3.1.1
-playwright>=1.49.0
-playwright-stealth==1.0.6
+fastapi
+uvicorn[standard]
+pydantic
+playwright
+gunicorn
