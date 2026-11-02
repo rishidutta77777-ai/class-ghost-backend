@@ -34,12 +34,12 @@ Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
 Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });
 window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
 
-const getParameter = WebGLRenderingContext.prototype.getParameter;
-WebGLRenderingContext.prototype.getParameter = function(param) {
-  if (param === 37445) return 'Intel Inc.';
-  if (param === 37446) return 'Intel(R) Iris(R) Xe Graphics';
-  return getParameter.apply(this, arguments);
-};
+if (navigator.mediaDevices) {
+  navigator.mediaDevices.getUserMedia = async () => {
+    throw new DOMException('Permission denied', 'NotAllowedError');
+  };
+  navigator.mediaDevices.enumerateDevices = async () => [];
+}
 """
 
 def make_anti_spoof_name(raw_name: str) -> str:
@@ -49,6 +49,10 @@ def make_anti_spoof_name(raw_name: str) -> str:
     return clean
 
 def parse_cookies_input(raw_json_str: str):
+    """
+    Preserves exact Cookie-Editor domains (accounts.google.com vs .google.com)
+    so Google never invalidates LSID / __Host-GAPS / __Secure-1PSID.
+    """
     if not raw_json_str or not raw_json_str.strip():
         return None, None
 
@@ -60,24 +64,56 @@ def parse_cookies_input(raw_json_str: str):
     elif isinstance(data, list):
         pw_cookies = []
         for c in data:
-            if "name" in c and "value" in c and "domain" in c:
-                samesite_raw = str(c.get("sameSite", "")).lower()
-                if samesite_raw in ["no_restriction", "none"]:
-                    samesite_val = "None"
-                elif samesite_raw == "strict":
-                    samesite_val = "Strict"
-                else:
-                    samesite_val = "Lax"
+            if not isinstance(c, dict) or "name" not in c or "value" not in c:
+                continue
+            name = str(c["name"])
+            val = str(c["value"])
+            raw_domain = str(c.get("domain", ".google.com")).strip()
+            path = str(c.get("path", "/"))
+            host_only = bool(c.get("hostOnly", False))
 
-                pw_cookies.append({
-                    "name": str(c["name"]),
-                    "value": str(c["value"]),
-                    "domain": str(c["domain"]),
-                    "path": str(c.get("path", "/")),
-                    "secure": bool(c.get("secure", True)),
-                    "httpOnly": bool(c.get("httpOnly", False)),
-                    "sameSite": samesite_val
-                })
+            samesite_raw = str(c.get("sameSite", "")).lower()
+            if samesite_raw in ["no_restriction", "none"]:
+                samesite_val = "None"
+            elif samesite_raw == "strict":
+                samesite_val = "Strict"
+            else:
+                samesite_val = "Lax"
+
+            is_secure = (
+                bool(c.get("secure", True))
+                or name.startswith("__Secure-")
+                or name.startswith("__Host-")
+                or samesite_val == "None"
+            )
+
+            cookie_obj = {
+                "name": name,
+                "value": val,
+                "path": path,
+                "secure": is_secure,
+                "httpOnly": bool(c.get("httpOnly", False)),
+                "sameSite": samesite_val
+            }
+
+            # __Host- cookies and hostOnly cookies (like accounts.google.com LSID) must NOT have a leading dot
+            if name.startswith("__Host-"):
+                clean_host = raw_domain.lstrip(".") or "accounts.google.com"
+                cookie_obj["url"] = f"https://{clean_host}"
+                cookie_obj["path"] = "/"
+                cookie_obj["secure"] = True
+            elif host_only or raw_domain.startswith("accounts.google"):
+                cookie_obj["domain"] = raw_domain.lstrip(".")
+            else:
+                cookie_obj["domain"] = raw_domain if raw_domain.startswith(".") else "." + raw_domain
+
+            if "expirationDate" in c and c["expirationDate"]:
+                try:
+                    cookie_obj["expires"] = float(c["expirationDate"])
+                except Exception:
+                    pass
+
+            pw_cookies.append(cookie_obj)
         return "cookie_list", pw_cookies
     return None, None
 
@@ -116,8 +152,6 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
             launch_args = [
                 "--headless=new",
                 "--disable-blink-features=AutomationControlled",
-                "--use-fake-ui-for-media-stream",
-                "--use-fake-device-for-media-stream",
                 "--mute-audio",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -127,7 +161,7 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                 "--disable-extensions",
                 "--disable-background-networking",
                 "--renderer-process-limit=1",
-                "--js-flags=--max-old-space-size=192",
+                "--js-flags=--max-old-space-size=256",
                 "--window-size=1280,720"
             ]
 
@@ -150,77 +184,90 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                 else:
                     raise launch_err
 
+            # Matching Android/Chrome or Windows UA consistently with Google session
             context_kwargs = {
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "viewport": {"width": 1280, "height": 720},
                 "locale": "en-IN",
                 "timezone_id": "Asia/Kolkata",
-                "permissions": ["microphone", "camera"]
+                "permissions": []
             }
 
             if auth_type == "storage_state":
                 context_kwargs["storage_state"] = auth_payload
 
             context = await browser.new_context(**context_kwargs)
+            loaded_cookie_count = 0
             if auth_type == "cookie_list" and auth_payload:
-                await context.add_cookies(auth_payload)
+                for ck in auth_payload:
+                    try:
+                        await context.add_cookies([ck])
+                        loaded_cookie_count += 1
+                    except Exception as ce:
+                        print(f"[!] Skipped cookie {ck.get('name')}: {ce}")
 
             await context.add_init_script(STEALTH_PATCH_JS)
             page = await context.new_page()
             await stealth_async(page)
 
-            async def block_heavy_assets(route):
-                if route.request.resource_type in ["font", "media"]:
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            await page.route("**/*", block_heavy_assets)
-
             with STATE_LOCK:
-                mode_label = "Authenticated Account" if auth_type else "Stealth Guest"
+                mode_label = f"Auth ({loaded_cookie_count} cookies)" if auth_type else "Stealth Guest"
                 BOT_STATE["message"] = f"Loading Google Meet ({mode_label})..."
 
             await page.goto(meet_url, wait_until="domcontentloaded", timeout=90000)
-            await asyncio.sleep(8)
+            await asyncio.sleep(6)
             await capture_snap(page)
 
-            # Hardware mute Mic (Ctrl+D) and Cam (Ctrl+E)
-            await page.keyboard.press("Control+d")
-            await asyncio.sleep(1)
-            await page.keyboard.press("Control+e")
+            # Check if Google forced a redirect to accounts.google.com/v3/signin
+            if "accounts.google.com" in page.url:
+                await capture_snap(page)
+                with STATE_LOCK:
+                    BOT_STATE["status"] = "error"
+                    BOT_STATE["message"] = (
+                        "Google rejected the cookies & showed the Sign-In page! "
+                        "Tap 🍪 Cookies -> Clear, or export ALL cookies while on meet.google.com (logged in)."
+                    )
+                return
 
-            # Smart Lobby Handler: Loops for up to 35 seconds on slow 0.1 CPU to clear popups, fill name, and click Join
             joined_clicked = False
             name_typed = False
 
-            for attempt in range(12):
+            for attempt in range(20):
                 with STATE_LOCK:
                     if BOT_STATE["stop_requested"]:
                         break
 
                 await capture_snap(page)
 
-                # Check if Google blocked anonymous access completely
+                if "accounts.google.com" in page.url:
+                    with STATE_LOCK:
+                        BOT_STATE["status"] = "error"
+                        BOT_STATE["message"] = "Redirected to Google Sign-In! Clear 🍪 Cookies to test Guest Mode or re-export cookies."
+                    return
+
                 body_txt = ""
                 try:
                     body_txt = await page.inner_text("body")
                 except Exception:
                     pass
 
-                if "You can't join this call" in body_txt or "Sign in to join" in body_txt:
+                if "Getting ready..." in body_txt:
+                    with STATE_LOCK:
+                        BOT_STATE["message"] = f"Waiting for Meet lobby ({attempt+1}/20)..."
+
+                if "You can't join this call" in body_txt or "Return to home screen" in body_txt:
                     with STATE_LOCK:
                         BOT_STATE["status"] = "error"
-                        BOT_STATE["message"] = "Host blocked guests! Paste your Google Cookies in the app first."
+                        BOT_STATE["message"] = "Meeting restricted or closed! Check /view screenshot."
                     return
 
-                # 1. Dismiss permission/warning popups
+                # 1. Dismiss permission/warning dialogs
                 for popup_text in [
                     "Continue without microphone and camera",
                     "Continue without microphone",
-                    "Allow microphone and camera",
                     "Got it",
-                    "Dismiss"
+                    "Dismiss",
+                    "Close"
                 ]:
                     try:
                         p_btn = page.locator(f"button:has-text('{popup_text}'), [role='button']:has-text('{popup_text}')").first
@@ -230,27 +277,26 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                     except Exception:
                         pass
 
-                # 2. Fill Custom Name if guest name box is visible
-                if not name_typed:
+                # 2. Fill Custom Name ONLY if we are on meet.google.com and the 'Your name' input is visible
+                if not name_typed and "meet.google.com" in page.url:
                     try:
-                        name_input = page.locator("input[type='text'], input[placeholder*='name' i], input[aria-label*='name' i]").first
+                        name_input = page.locator("input[placeholder*='name' i], input[aria-label*='name' i]").first
                         if await name_input.is_visible():
                             with STATE_LOCK:
-                                BOT_STATE["message"] = f"Typing name: {raw_name}..."
+                                BOT_STATE["message"] = f"Typing guest name: {raw_name}..."
                             await name_input.click(force=True)
-                            await asyncio.sleep(0.4)
-                            await name_input.fill("")
-                            await name_input.type(safe_name, delay=75)
+                            await asyncio.sleep(0.3)
+                            await name_input.fill(safe_name)
                             name_typed = True
                             await asyncio.sleep(1)
                     except Exception:
                         pass
 
-                # 3. Search for Join / Ask to join button via Playwright + JS fallback
-                for btn_label in ["Ask to join", "Join now", "Switch here", "Join"]:
+                # 3. Click 'Ask to join' or 'Join now'
+                for btn_label in ["Join now", "Ask to join", "Switch here"]:
                     try:
                         btn = page.locator(
-                            f"button:has-text('{btn_label}'), [role='button']:has-text('{btn_label}'), span:has-text('{btn_label}')"
+                            f"button:has-text('{btn_label}'), [role='button']:has-text('{btn_label}')"
                         ).first
                         if await btn.is_visible():
                             await btn.click(force=True)
@@ -264,12 +310,13 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
 
                 await asyncio.sleep(3)
 
+            await asyncio.sleep(3)
             await capture_snap(page)
 
             if not joined_clicked:
                 with STATE_LOCK:
                     BOT_STATE["status"] = "error"
-                    BOT_STATE["message"] = "Join button not found! Tap '📸 View Live Snapshot' to see what Google showed."
+                    BOT_STATE["message"] = "Join button not found! Tap '📸 View Live Screenshot' to check."
                 return
 
             with STATE_LOCK:
@@ -361,7 +408,6 @@ def status():
 
 @app.route("/view", methods=["GET"])
 def view_snapshot():
-    """Live snapshot endpoint ending with /view so you can see what the bot sees."""
     if LAST_SCREENSHOT:
         return Response(LAST_SCREENSHOT, mimetype="image/jpeg")
     return "<h3>No snapshot captured yet. Deploy the bot first!</h3>", 404
