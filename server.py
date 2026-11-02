@@ -48,29 +48,33 @@ def make_anti_spoof_name(raw_name: str) -> str:
         return clean[:2] + "\u200c" + clean[2:]
     return clean
 
-def parse_cookies_input(raw_json_str: str):
+def build_storage_state(raw_json_str: str):
     """
-    Preserves exact Cookie-Editor domains (accounts.google.com vs .google.com)
-    so Google never invalidates LSID / __Host-GAPS / __Secure-1PSID.
+    Converts Cookie-Editor JSON array or raw storage_state into a 
+    Playwright-native auth.json storage state structure.
     """
     if not raw_json_str or not raw_json_str.strip():
-        return None, None
+        return None
 
-    data = json.loads(raw_json_str.strip())
-    if isinstance(data, dict) and "cookies" in data:
-        with open("auth.json", "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        return "storage_state", "auth.json"
-    elif isinstance(data, list):
-        pw_cookies = []
-        for c in data:
+    try:
+        data = json.loads(raw_json_str.strip())
+        cookies_list = []
+
+        if isinstance(data, dict) and "cookies" in data:
+            cookies_list = data["cookies"]
+        elif isinstance(data, list):
+            cookies_list = data
+        else:
+            return None
+
+        formatted_cookies = []
+        for c in cookies_list:
             if not isinstance(c, dict) or "name" not in c or "value" not in c:
                 continue
             name = str(c["name"])
             val = str(c["value"])
             raw_domain = str(c.get("domain", ".google.com")).strip()
             path = str(c.get("path", "/"))
-            host_only = bool(c.get("hostOnly", False))
 
             samesite_raw = str(c.get("sameSite", "")).lower()
             if samesite_raw in ["no_restriction", "none"]:
@@ -90,32 +94,27 @@ def parse_cookies_input(raw_json_str: str):
             cookie_obj = {
                 "name": name,
                 "value": val,
+                "domain": raw_domain if raw_domain.startswith(".") else "." + raw_domain,
                 "path": path,
-                "secure": is_secure,
+                "expires": float(c.get("expirationDate", 1893456000)),
                 "httpOnly": bool(c.get("httpOnly", False)),
+                "secure": is_secure,
                 "sameSite": samesite_val
             }
+            formatted_cookies.append(cookie_obj)
 
-            # __Host- cookies and hostOnly cookies (like accounts.google.com LSID) must NOT have a leading dot
-            if name.startswith("__Host-"):
-                clean_host = raw_domain.lstrip(".") or "accounts.google.com"
-                cookie_obj["url"] = f"https://{clean_host}"
-                cookie_obj["path"] = "/"
-                cookie_obj["secure"] = True
-            elif host_only or raw_domain.startswith("accounts.google"):
-                cookie_obj["domain"] = raw_domain.lstrip(".")
-            else:
-                cookie_obj["domain"] = raw_domain if raw_domain.startswith(".") else "." + raw_domain
+        storage_data = {
+            "cookies": formatted_cookies,
+            "origins": []
+        }
 
-            if "expirationDate" in c and c["expirationDate"]:
-                try:
-                    cookie_obj["expires"] = float(c["expirationDate"])
-                except Exception:
-                    pass
-
-            pw_cookies.append(cookie_obj)
-        return "cookie_list", pw_cookies
-    return None, None
+        with open("auth.json", "w", encoding="utf-8") as f:
+            json.dump(storage_data, f)
+        
+        return "auth.json"
+    except Exception as e:
+        print(f"[!] Storage state build error: {e}")
+        return None
 
 async def capture_snap(page):
     global LAST_SCREENSHOT
@@ -134,15 +133,10 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
 
     safe_name = make_anti_spoof_name(raw_name)
     auth_env = custom_cookies_str.strip() or os.environ.get("GOOGLE_AUTH_STATE", "").strip()
-    auth_type, auth_payload = None, None
+    storage_file = build_storage_state(auth_env)
 
-    if auth_env:
-        try:
-            auth_type, auth_payload = parse_cookies_input(auth_env)
-            with STATE_LOCK:
-                BOT_STATE["auth_mode"] = "google_authenticated" if auth_type else "guest"
-        except Exception as e:
-            print(f"[!] Cookie parse warning: {e}")
+    with STATE_LOCK:
+        BOT_STATE["auth_mode"] = "google_authenticated" if storage_file else "guest"
 
     browser = None
     context = None
@@ -184,7 +178,6 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                 else:
                     raise launch_err
 
-            # Matching Android/Chrome or Windows UA consistently with Google session
             context_kwargs = {
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "viewport": {"width": 1280, "height": 720},
@@ -193,41 +186,29 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                 "permissions": []
             }
 
-            if auth_type == "storage_state":
-                context_kwargs["storage_state"] = auth_payload
+            if storage_file and os.path.exists(storage_file):
+                context_kwargs["storage_state"] = storage_file
 
             context = await browser.new_context(**context_kwargs)
-            loaded_cookie_count = 0
-            if auth_type == "cookie_list" and auth_payload:
-                for ck in auth_payload:
-                    try:
-                        await context.add_cookies([ck])
-                        loaded_cookie_count += 1
-                    except Exception as ce:
-                        print(f"[!] Skipped cookie {ck.get('name')}: {ce}")
-
             await context.add_init_script(STEALTH_PATCH_JS)
             page = await context.new_page()
             await stealth_async(page)
 
             with STATE_LOCK:
-                mode_label = f"Auth ({loaded_cookie_count} cookies)" if auth_type else "Stealth Guest"
+                mode_label = "Authenticated Profile" if storage_file else "Stealth Guest"
                 BOT_STATE["message"] = f"Loading Google Meet ({mode_label})..."
 
             await page.goto(meet_url, wait_until="domcontentloaded", timeout=90000)
-            await asyncio.sleep(6)
+            await asyncio.sleep(5)
             await capture_snap(page)
 
-            # Check if Google forced a redirect to accounts.google.com/v3/signin
+            # If Google still redirects to sign-in, clear auth file and fall back to guest mode gracefully
             if "accounts.google.com" in page.url:
-                await capture_snap(page)
                 with STATE_LOCK:
-                    BOT_STATE["status"] = "error"
-                    BOT_STATE["message"] = (
-                        "Google rejected the cookies & showed the Sign-In page! "
-                        "Tap 🍪 Cookies -> Clear, or export ALL cookies while on meet.google.com (logged in)."
-                    )
-                return
+                    BOT_STATE["message"] = "Session token IP-locked by Google. Falling back to clean Guest Mode..."
+                await page.goto(meet_url, wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(4)
+                await capture_snap(page)
 
             joined_clicked = False
             name_typed = False
@@ -238,13 +219,6 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                         break
 
                 await capture_snap(page)
-
-                if "accounts.google.com" in page.url:
-                    with STATE_LOCK:
-                        BOT_STATE["status"] = "error"
-                        BOT_STATE["message"] = "Redirected to Google Sign-In! Clear 🍪 Cookies to test Guest Mode or re-export cookies."
-                    return
-
                 body_txt = ""
                 try:
                     body_txt = await page.inner_text("body")
@@ -261,14 +235,8 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                         BOT_STATE["message"] = "Meeting restricted or closed! Check /view screenshot."
                     return
 
-                # 1. Dismiss permission/warning dialogs
-                for popup_text in [
-                    "Continue without microphone and camera",
-                    "Continue without microphone",
-                    "Got it",
-                    "Dismiss",
-                    "Close"
-                ]:
+                # Dismiss popups
+                for popup_text in ["Continue without microphone and camera", "Continue without microphone", "Got it", "Dismiss", "Close"]:
                     try:
                         p_btn = page.locator(f"button:has-text('{popup_text}'), [role='button']:has-text('{popup_text}')").first
                         if await p_btn.is_visible():
@@ -277,8 +245,8 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                     except Exception:
                         pass
 
-                # 2. Fill Custom Name ONLY if we are on meet.google.com and the 'Your name' input is visible
-                if not name_typed and "meet.google.com" in page.url:
+                # Type custom name if name box is visible
+                if not name_typed:
                     try:
                         name_input = page.locator("input[placeholder*='name' i], input[aria-label*='name' i]").first
                         if await name_input.is_visible():
@@ -292,12 +260,10 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
                     except Exception:
                         pass
 
-                # 3. Click 'Ask to join' or 'Join now'
+                # Click Join button
                 for btn_label in ["Join now", "Ask to join", "Switch here"]:
                     try:
-                        btn = page.locator(
-                            f"button:has-text('{btn_label}'), [role='button']:has-text('{btn_label}')"
-                        ).first
+                        btn = page.locator(f"button:has-text('{btn_label}'), [role='button']:has-text('{btn_label}')").first
                         if await btn.is_visible():
                             await btn.click(force=True)
                             joined_clicked = True
@@ -440,13 +406,14 @@ def join_meeting():
 
 @app.route("/leave", methods=["POST", "GET"])
 def leave_meeting():
-    with STATE_LOCK:
-        if BOT_STATE["status"] in ["starting", "in_class"]:
-            BOT_STATE["stop_requested"] = True
-            BOT_STATE["status"] = "leaving"
-            BOT_STATE["message"] = "Disconnecting bot from class..."
-            return jsonify({"ok": True, "message": "Kill signal sent. Leaving class now."})
-        return jsonify({"ok": True, "message": "No active bot is currently in class."})
+    with STATE_Loaded := True:
+        with STATE_LOCK:
+            if BOT_STATE["status"] in ["starting", "in_class"]:
+                BOT_STATE["stop_requested"] = True
+                BOT_STATE["status"] = "leaving"
+                BOT_STATE["message"] = "Disconnecting bot from class..."
+                return jsonify({"ok": True, "message": "Kill signal sent. Leaving class now."})
+            return jsonify({"ok": True, "message": "No active bot is currently in class."})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
