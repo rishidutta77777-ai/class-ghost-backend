@@ -1,420 +1,270 @@
-import os
-import gc
-import json
 import asyncio
-import threading
-import subprocess
-from flask import Flask, request, jsonify, Response
-from flask_cors import CORS
+import os
+import uuid
+import gc
+from typing import List, Dict, Any
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+app = FastAPI()
 
-app = Flask(__name__)
-CORS(app)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-BOT_STATE = {
-    "status": "idle",       # idle | starting | in_class | leaving | error
-    "message": "Ready to deploy.",
-    "participants": 0,
-    "meet_url": "",
-    "student_name": "",
-    "auth_mode": "guest",
-    "stop_requested": False
-}
+sessions = {}
 
-LAST_SCREENSHOT = None
-STATE_LOCK = threading.Lock()
+class MeetingRequest(BaseModel):
+    url: str
+    name: str = "Authenticated Bot"
+    cookies: List[Dict[str, Any]] = Field(..., min_items=1)
 
-STEALTH_PATCH_JS = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
-Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en-US', 'en'] });
-window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+class StopRequest(BaseModel):
+    session_id: str
 
-if (navigator.mediaDevices) {
-  navigator.mediaDevices.getUserMedia = async () => {
-    throw new DOMException('Permission denied', 'NotAllowedError');
-  };
-  navigator.mediaDevices.enumerateDevices = async () => [];
-}
-"""
-
-def make_anti_spoof_name(raw_name: str) -> str:
-    clean = raw_name.strip()
-    if len(clean) > 2:
-        return clean[:2] + "\u200c" + clean[2:]
-    return clean
-
-def build_storage_state(raw_json_str: str):
-    """
-    Converts Cookie-Editor JSON array or raw storage_state into a 
-    Playwright-native auth.json storage state structure.
-    """
-    if not raw_json_str or not raw_json_str.strip():
-        return None
-
-    try:
-        data = json.loads(raw_json_str.strip())
-        cookies_list = []
-
-        if isinstance(data, dict) and "cookies" in data:
-            cookies_list = data["cookies"]
-        elif isinstance(data, list):
-            cookies_list = data
-        else:
-            return None
-
-        formatted_cookies = []
-        for c in cookies_list:
-            if not isinstance(c, dict) or "name" not in c or "value" not in c:
-                continue
-            name = str(c["name"])
-            val = str(c["value"])
-            raw_domain = str(c.get("domain", ".google.com")).strip()
-            path = str(c.get("path", "/"))
-
-            samesite_raw = str(c.get("sameSite", "")).lower()
-            if samesite_raw in ["no_restriction", "none"]:
-                samesite_val = "None"
-            elif samesite_raw == "strict":
-                samesite_val = "Strict"
-            else:
-                samesite_val = "Lax"
-
-            is_secure = (
-                bool(c.get("secure", True))
-                or name.startswith("__Secure-")
-                or name.startswith("__Host-")
-                or samesite_val == "None"
-            )
-
-            cookie_obj = {
-                "name": name,
-                "value": val,
-                "domain": raw_domain if raw_domain.startswith(".") else "." + raw_domain,
-                "path": path,
-                "expires": float(c.get("expirationDate", 1893456000)),
-                "httpOnly": bool(c.get("httpOnly", False)),
-                "secure": is_secure,
-                "sameSite": samesite_val
-            }
-            formatted_cookies.append(cookie_obj)
-
-        storage_data = {
-            "cookies": formatted_cookies,
-            "origins": []
-        }
-
-        with open("auth.json", "w", encoding="utf-8") as f:
-            json.dump(storage_data, f)
-        
-        return "auth.json"
-    except Exception as e:
-        print(f"[!] Storage state build error: {e}")
-        return None
-
-async def capture_snap(page):
-    global LAST_SCREENSHOT
-    try:
-        LAST_SCREENSHOT = await page.screenshot(type="jpeg", quality=55)
-    except Exception:
-        pass
-
-async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_participants: int, custom_cookies_str: str):
-    global LAST_SCREENSHOT
-    with STATE_LOCK:
-        BOT_STATE["status"] = "starting"
-        BOT_STATE["message"] = "Booting stealth browser..."
-        BOT_STATE["participants"] = 0
-        BOT_STATE["stop_requested"] = False
-
-    safe_name = make_anti_spoof_name(raw_name)
-    auth_env = custom_cookies_str.strip() or os.environ.get("GOOGLE_AUTH_STATE", "").strip()
-    storage_file = build_storage_state(auth_env)
-
-    with STATE_LOCK:
-        BOT_STATE["auth_mode"] = "google_authenticated" if storage_file else "guest"
-
-    browser = None
-    context = None
-
-    try:
-        async with async_playwright() as p:
-            launch_args = [
-                "--headless=new",
-                "--disable-blink-features=AutomationControlled",
-                "--mute-audio",
+async def run_bot_lifecycle(session_id: str, url: str, name: str, user_cookies: List[Dict[str, Any]]):
+    async with async_playwright() as p:
+        # Launch Chromium with anti-fingerprinting flags
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--disable-extensions",
-                "--disable-background-networking",
+                "--disable-blink-features=AutomationControlled",
+                "--deny-permission-prompts",
+                "--mute-audio",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-features=AudioServiceSandbox,TranslateUI,WebRtcHideLocalIpsWithMdns",
                 "--renderer-process-limit=1",
-                "--js-flags=--max-old-space-size=256",
-                "--window-size=1280,720"
+                "--js-flags=--max-old-space-size=96"
             ]
-
-            try:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    ignore_default_args=["--enable-automation"],
-                    args=launch_args
-                )
-            except Exception as launch_err:
-                if "Executable doesn't exist" in str(launch_err):
-                    with STATE_LOCK:
-                        BOT_STATE["message"] = "Installing Chromium (one-time ~40s setup)..."
-                    subprocess.run(["playwright", "install", "chromium"], check=True)
-                    browser = await p.chromium.launch(
-                        headless=True,
-                        ignore_default_args=["--enable-automation"],
-                        args=launch_args
-                    )
-                else:
-                    raise launch_err
-
-            context_kwargs = {
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "viewport": {"width": 1280, "height": 720},
-                "locale": "en-IN",
-                "timezone_id": "Asia/Kolkata",
-                "permissions": []
+        )
+        
+        # Emulate authentic desktop client context
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            permissions=[],
+            viewport={"width": 1280, "height": 720},
+            device_scale_factor=1,
+            color_scheme="dark",
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"'
             }
+        )
 
-            if storage_file and os.path.exists(storage_file):
-                context_kwargs["storage_state"] = storage_file
+        # Inject session cookies
+        clean_cookies = []
+        for c in user_cookies:
+            try:
+                name_val = str(c.get("name", "")).strip()
+                val = str(c.get("value", "")).strip()
+                if not name_val:
+                    continue
 
-            context = await browser.new_context(**context_kwargs)
-            await context.add_init_script(STEALTH_PATCH_JS)
-            page = await context.new_page()
-            await stealth_async(page)
+                raw_domain = str(c.get("domain", ".google.com")).strip()
+                clean_domain = raw_domain if raw_domain.startswith(".") else f".{raw_domain}"
 
-            with STATE_LOCK:
-                mode_label = "Authenticated Profile" if storage_file else "Stealth Guest"
-                BOT_STATE["message"] = f"Loading Google Meet ({mode_label})..."
+                entry = {
+                    "name": name_val,
+                    "value": val,
+                    "domain": clean_domain,
+                    "path": str(c.get("path", "/")),
+                    "secure": True
+                }
 
-            await page.goto(meet_url, wait_until="domcontentloaded", timeout=90000)
-            await asyncio.sleep(5)
-            await capture_snap(page)
+                same_site = c.get("sameSite")
+                if isinstance(same_site, str):
+                    s_lower = same_site.lower()
+                    if s_lower in ["none", "no_restriction"]:
+                        entry["sameSite"] = "None"
+                    elif s_lower == "lax":
+                        entry["sameSite"] = "Lax"
+                    elif s_lower == "strict":
+                        entry["sameSite"] = "Strict"
 
-            # If Google still redirects to sign-in, clear auth file and fall back to guest mode gracefully
-            if "accounts.google.com" in page.url:
-                with STATE_LOCK:
-                    BOT_STATE["message"] = "Session token IP-locked by Google. Falling back to clean Guest Mode..."
-                await page.goto(meet_url, wait_until="domcontentloaded", timeout=60000)
-                await asyncio.sleep(4)
-                await capture_snap(page)
+                clean_cookies.append(entry)
+            except Exception:
+                continue
 
-            joined_clicked = False
-            name_typed = False
+        try:
+            await context.add_cookies(clean_cookies)
+            print(f"[{session_id}] Successfully configured {len(clean_cookies)} cookies.")
+        except Exception as e:
+            print(f"[{session_id}] Cookie configuration error: {e}")
+        finally:
+            del user_cookies
+            del clean_cookies
+            gc.collect()
 
-            for attempt in range(20):
-                with STATE_LOCK:
-                    if BOT_STATE["stop_requested"]:
-                        break
+        page = await context.new_page()
 
-                await capture_snap(page)
-                body_txt = ""
-                try:
-                    body_txt = await page.inner_text("body")
-                except Exception:
-                    pass
+        # Comprehensive browser fingerprint neutralization
+        await page.add_init_script("""
+            // Mask webdriver
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-                if "Getting ready..." in body_txt:
-                    with STATE_LOCK:
-                        BOT_STATE["message"] = f"Waiting for Meet lobby ({attempt+1}/20)..."
+            // Emulate Chrome runtime
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {}
+            };
 
-                if "You can't join this call" in body_txt or "Return to home screen" in body_txt:
-                    with STATE_LOCK:
-                        BOT_STATE["status"] = "error"
-                        BOT_STATE["message"] = "Meeting restricted or closed! Check /view screenshot."
-                    return
+            // Emulate standard desktop plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin' }
+                ]
+            });
 
-                # Dismiss popups
-                for popup_text in ["Continue without microphone and camera", "Continue without microphone", "Got it", "Dismiss", "Close"]:
-                    try:
-                        p_btn = page.locator(f"button:has-text('{popup_text}'), [role='button']:has-text('{popup_text}')").first
-                        if await p_btn.is_visible():
-                            await p_btn.click(force=True)
+            // Mask permissions API query
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        """)
+
+        # Block extraneous static images and webfonts to preserve 512MB RAM cap
+        async def block_heavy_resources(route):
+            req = route.request
+            if req.resource_type in ["image", "font"]:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", block_heavy_resources)
+        sessions[session_id] = {"browser": browser, "page": page, "status": "running"}
+
+        try:
+            print(f"[{session_id}] Navigating to meeting URL...")
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+
+            # Resolve pre-join lobby state
+            joined = False
+            for _ in range(25):
+                # Dismiss system/cookie prompts
+                for text in ["Got it", "Dismiss", "I agree", "Accept all", "Continue without microphone", "Continue without camera"]:
+                    btn = page.locator(f'button:has-text("{text}")')
+                    if await btn.count() > 0:
+                        try:
+                            await btn.first.click(timeout=800)
+                        except Exception:
+                            pass
+
+                # Locate primary join actions
+                join_targets = [
+                    'button:has-text("Ask to join")',
+                    'button:has-text("Join now")',
+                    'button[aria-label*="Ask to join"]',
+                    'button[aria-label*="Join now"]',
+                    '[data-mdc-dialog-action="join"]'
+                ]
+
+                for selector in join_targets:
+                    btn = page.locator(selector)
+                    if await btn.count() > 0:
+                        if await btn.first.is_visible() and await btn.first.is_enabled():
+                            print(f"[{session_id}] Triggering entry button: {selector}")
+                            # Human-like interaction pause
                             await asyncio.sleep(1)
-                    except Exception:
-                        pass
-
-                # Type custom name if name box is visible
-                if not name_typed:
-                    try:
-                        name_input = page.locator("input[placeholder*='name' i], input[aria-label*='name' i]").first
-                        if await name_input.is_visible():
-                            with STATE_LOCK:
-                                BOT_STATE["message"] = f"Typing guest name: {raw_name}..."
-                            await name_input.click(force=True)
-                            await asyncio.sleep(0.3)
-                            await name_input.fill(safe_name)
-                            name_typed = True
-                            await asyncio.sleep(1)
-                    except Exception:
-                        pass
-
-                # Click Join button
-                for btn_label in ["Join now", "Ask to join", "Switch here"]:
-                    try:
-                        btn = page.locator(f"button:has-text('{btn_label}'), [role='button']:has-text('{btn_label}')").first
-                        if await btn.is_visible():
-                            await btn.click(force=True)
-                            joined_clicked = True
+                            await btn.first.click()
+                            joined = True
                             break
-                    except Exception:
-                        pass
 
-                if joined_clicked:
+                if joined:
                     break
 
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
-            await asyncio.sleep(3)
-            await capture_snap(page)
+            await asyncio.sleep(8)
 
-            if not joined_clicked:
-                with STATE_LOCK:
-                    BOT_STATE["status"] = "error"
-                    BOT_STATE["message"] = "Join button not found! Tap '📸 View Live Screenshot' to check."
-                return
+            # Sever incoming WebRTC streams to prevent memory leaks under 512MB ceiling
+            try:
+                await page.evaluate("""
+                    () => {
+                        document.querySelectorAll('audio, video').forEach(el => {
+                            el.muted = true;
+                            el.pause();
+                            if (el.srcObject) {
+                                el.srcObject.getTracks().forEach(track => track.stop());
+                                el.srcObject = null;
+                            }
+                        });
 
-            with STATE_LOCK:
-                BOT_STATE["status"] = "in_class"
-                BOT_STATE["message"] = "Active in Class / Waiting Room (Mic & Cam OFF)."
+                        if (window.RTCPeerConnection) {
+                            RTCPeerConnection.prototype.addTrack = function() {
+                                return null;
+                            };
+                        }
+                    }
+                """)
+            except Exception:
+                pass
 
-            elapsed = 0
-            max_seconds = max_minutes * 60
-            peak_participants = 0
+            # Confirmation snapshot
+            try:
+                await page.screenshot(path="last_view.png")
+            except Exception:
+                pass
 
-            while elapsed < max_seconds:
-                with STATE_LOCK:
-                    if BOT_STATE["stop_requested"]:
-                        BOT_STATE["status"] = "leaving"
-                        BOT_STATE["message"] = "Emergency Leave triggered by user."
-                        break
+            gc.collect()
 
-                await asyncio.sleep(10)
-                elapsed += 10
-                await capture_snap(page)
+            # Lightweight idle loop
+            while session_id in sessions and sessions[session_id]["status"] == "running":
+                await asyncio.sleep(25)
+                gc.collect()
 
-                try:
-                    body_text = await page.inner_text("body")
-                    if any(phrase in body_text for phrase in [
-                        "You've left the call",
-                        "The call ended",
-                        "removed from the meeting",
-                        "Return to home screen",
-                        "No one else is here",
-                        "denied your request"
-                    ]):
-                        with STATE_LOCK:
-                            BOT_STATE["message"] = "Session ended by teacher. Left automatically."
-                        break
-                except Exception:
-                    pass
+        except Exception as e:
+            print(f"[{session_id}] Runtime encountered error: {e}")
+        finally:
+            await browser.close()
+            if session_id in sessions:
+                sessions[session_id]["status"] = "ended"
+            gc.collect()
 
-                try:
-                    badge = page.locator("div.uGOf1d").first
-                    if await badge.is_visible():
-                        count_str = (await badge.inner_text()).strip()
-                        if count_str.isdigit():
-                            count = int(count_str)
-                            with STATE_LOCK:
-                                BOT_STATE["participants"] = count
-                                BOT_STATE["message"] = f"In Class • {count} participants present."
-                            if count > peak_participants:
-                                peak_participants = count
-                            if peak_participants >= min_participants and count < min_participants:
-                                with STATE_LOCK:
-                                    BOT_STATE["message"] = f"Class ended (dropped to {count} students). Auto-left!"
-                                break
-                except Exception:
-                    pass
+@app.get("/view")
+async def view_screen():
+    if os.path.exists("last_view.png"):
+        return FileResponse("last_view.png", media_type="image/png")
+    return Response(content="No snapshot captured yet", media_type="text/plain")
 
-    except Exception as e:
-        with STATE_LOCK:
-            BOT_STATE["status"] = "error"
-            BOT_STATE["message"] = f"Bot error: {str(e)[:140]}"
-    finally:
+@app.post("/start")
+async def start_session(req: MeetingRequest, background_tasks: BackgroundTasks):
+    session_id = str(uuid.uuid4())
+    sessions[session_id] = {"status": "starting"}
+    background_tasks.add_task(run_bot_lifecycle, session_id, req.url, req.name, req.cookies)
+    return {"session_id": session_id}
+
+@app.post("/stop")
+async def stop_session(req: StopRequest):
+    sess = sessions.get(req.session_id)
+    if sess and "browser" in sess:
+        sess["status"] = "ended"
         try:
-            if context:
-                await context.close()
-            if browser:
-                await browser.close()
+            await sess["browser"].close()
         except Exception:
             pass
-        gc.collect()
-        with STATE_LOCK:
-            if BOT_STATE["status"] != "error":
-                BOT_STATE["status"] = "idle"
-            BOT_STATE["participants"] = 0
-            BOT_STATE["stop_requested"] = False
+    return {"status": "terminated"}
 
-def run_async_bot(meet_url, student_name, max_minutes, min_participants, custom_cookies):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(meet_bot_worker(meet_url, student_name, max_minutes, min_participants, custom_cookies))
-    loop.close()
-
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "service": "GhostAttend Low-RAM Stealth Server", "state": BOT_STATE})
-
-@app.route("/status", methods=["GET"])
-def status():
-    with STATE_LOCK:
-        return jsonify(BOT_STATE)
-
-@app.route("/view", methods=["GET"])
-def view_snapshot():
-    if LAST_SCREENSHOT:
-        return Response(LAST_SCREENSHOT, mimetype="image/jpeg")
-    return "<h3>No snapshot captured yet. Deploy the bot first!</h3>", 404
-
-@app.route("/join", methods=["POST", "GET"])
-def join_meeting():
-    data = request.get_json(silent=True) or request.args
-    meet_url = (data.get("meet_url") or data.get("url") or "").strip()
-    student_name = (data.get("student_name") or data.get("name") or "Hrishikesh Dutta").strip()
-    max_minutes = int(data.get("max_duration") or data.get("duration") or 125)
-    min_participants = int(data.get("min_participants") or 5)
-    custom_cookies = (data.get("google_cookies") or "").strip()
-
-    if not meet_url or "meet.google.com" not in meet_url:
-        return jsonify({"ok": False, "error": "Please provide a valid Google Meet link."}), 400
-
-    with STATE_LOCK:
-        if BOT_STATE["status"] in ["starting", "in_class"]:
-            return jsonify({"ok": False, "error": "A bot is already active. Tap Leave first."}), 409
-        BOT_STATE["meet_url"] = meet_url
-        BOT_STATE["student_name"] = student_name
-
-    thread = threading.Thread(
-        target=run_async_bot,
-        args=(meet_url, student_name, max_minutes, min_participants, custom_cookies),
-        daemon=True
-    )
-    thread.start()
-    return jsonify({"ok": True, "message": "Stealth bot deployed!", "state": BOT_STATE})
-
-@app.route("/leave", methods=["POST", "GET"])
-def leave_meeting():
-    with STATE_Loaded := True:
-        with STATE_LOCK:
-            if BOT_STATE["status"] in ["starting", "in_class"]:
-                BOT_STATE["stop_requested"] = True
-                BOT_STATE["status"] = "leaving"
-                BOT_STATE["message"] = "Disconnecting bot from class..."
-                return jsonify({"ok": True, "message": "Kill signal sent. Leaving class now."})
-            return jsonify({"ok": True, "message": "No active bot is currently in class."})
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+@app.get("/status")
+async def get_status(session_id: str):
+    sess = sessions.get(session_id, {"status": "ended"})
+    return {"status": sess.get("status", "ended")}
