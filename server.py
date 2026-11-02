@@ -10,6 +10,9 @@ from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright
 
 app = FastAPI()
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 app.add_middleware(
     CORSMiddleware,
