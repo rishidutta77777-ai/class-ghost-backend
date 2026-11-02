@@ -4,12 +4,11 @@ import json
 import asyncio
 import threading
 import subprocess
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
-# Force Playwright to keep Chromium inside the project folder so Render never wipes it
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 
 app = Flask(__name__)
@@ -25,6 +24,7 @@ BOT_STATE = {
     "stop_requested": False
 }
 
+LAST_SCREENSHOT = None
 STATE_LOCK = threading.Lock()
 
 STEALTH_PATCH_JS = """
@@ -49,11 +49,6 @@ def make_anti_spoof_name(raw_name: str) -> str:
     return clean
 
 def parse_cookies_input(raw_json_str: str):
-    """
-    Supports both:
-    1. Playwright storage_state JSON: {"cookies": [...], "origins": [...]}
-    2. Browser Cookie-Editor extension JSON array: [{"name": "SID", "value": "...", ...}]
-    """
     if not raw_json_str or not raw_json_str.strip():
         return None, None
 
@@ -63,27 +58,41 @@ def parse_cookies_input(raw_json_str: str):
             json.dump(data, f)
         return "storage_state", "auth.json"
     elif isinstance(data, list):
-        # Convert Cookie-Editor array to Playwright compatible cookies
         pw_cookies = []
         for c in data:
             if "name" in c and "value" in c and "domain" in c:
-                cookie_item = {
-                    "name": c["name"],
-                    "value": c["value"],
-                    "domain": c["domain"],
-                    "path": c.get("path", "/"),
+                samesite_raw = str(c.get("sameSite", "")).lower()
+                if samesite_raw in ["no_restriction", "none"]:
+                    samesite_val = "None"
+                elif samesite_raw == "strict":
+                    samesite_val = "Strict"
+                else:
+                    samesite_val = "Lax"
+
+                pw_cookies.append({
+                    "name": str(c["name"]),
+                    "value": str(c["value"]),
+                    "domain": str(c["domain"]),
+                    "path": str(c.get("path", "/")),
                     "secure": bool(c.get("secure", True)),
                     "httpOnly": bool(c.get("httpOnly", False)),
-                    "sameSite": "None" if str(c.get("sameSite", "")).lower() in ["no_restriction", "none"] else "Lax"
-                }
-                pw_cookies.append(cookie_item)
+                    "sameSite": samesite_val
+                })
         return "cookie_list", pw_cookies
     return None, None
 
+async def capture_snap(page):
+    global LAST_SCREENSHOT
+    try:
+        LAST_SCREENSHOT = await page.screenshot(type="jpeg", quality=55)
+    except Exception:
+        pass
+
 async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_participants: int, custom_cookies_str: str):
+    global LAST_SCREENSHOT
     with STATE_LOCK:
         BOT_STATE["status"] = "starting"
-        BOT_STATE["message"] = "Preparing stealth browser..."
+        BOT_STATE["message"] = "Booting stealth browser..."
         BOT_STATE["participants"] = 0
         BOT_STATE["stop_requested"] = False
 
@@ -131,7 +140,7 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
             except Exception as launch_err:
                 if "Executable doesn't exist" in str(launch_err):
                     with STATE_LOCK:
-                        BOT_STATE["message"] = "Installing Chromium binary (one-time ~40s setup)..."
+                        BOT_STATE["message"] = "Installing Chromium (one-time ~40s setup)..."
                     subprocess.run(["playwright", "install", "chromium"], check=True)
                     browser = await p.chromium.launch(
                         headless=True,
@@ -169,62 +178,103 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
             await page.route("**/*", block_heavy_assets)
 
             with STATE_LOCK:
-                mode_label = "Authenticated Google Account" if auth_type else "Stealth Guest Mode"
-                BOT_STATE["message"] = f"Opening Meet ({mode_label})..."
+                mode_label = "Authenticated Account" if auth_type else "Stealth Guest"
+                BOT_STATE["message"] = f"Loading Google Meet ({mode_label})..."
 
             await page.goto(meet_url, wait_until="domcontentloaded", timeout=90000)
-            await asyncio.sleep(10)
+            await asyncio.sleep(8)
+            await capture_snap(page)
 
             # Hardware mute Mic (Ctrl+D) and Cam (Ctrl+E)
             await page.keyboard.press("Control+d")
             await asyncio.sleep(1)
             await page.keyboard.press("Control+e")
-            await asyncio.sleep(2)
 
-            for dismiss_text in ["Continue without microphone and camera", "Got it", "Dismiss"]:
-                try:
-                    d_btn = page.locator(f"button:has-text('{dismiss_text}')").first
-                    if await d_btn.is_visible():
-                        await d_btn.click()
-                        await asyncio.sleep(1)
-                except Exception:
-                    pass
-
-            # Only type custom name if the lobby asks for one (unauthenticated guest)
-            try:
-                name_input = page.locator("input[type='text'], input[aria-label*='name' i]").first
-                if await name_input.is_visible():
-                    with STATE_LOCK:
-                        BOT_STATE["message"] = f"Typing display name: {raw_name}..."
-                    await name_input.click()
-                    await asyncio.sleep(0.5)
-                    await name_input.fill("")
-                    await name_input.type(safe_name, delay=90)
-                    await asyncio.sleep(1.5)
-            except Exception:
-                pass
-
-            # Click 'Join now' or 'Ask to join'
+            # Smart Lobby Handler: Loops for up to 35 seconds on slow 0.1 CPU to clear popups, fill name, and click Join
             joined_clicked = False
-            for btn_label in ["Join now", "Ask to join", "Switch here"]:
-                try:
-                    btn = page.locator(f"button:has-text('{btn_label}')").first
-                    if await btn.is_visible():
-                        await btn.click()
-                        joined_clicked = True
+            name_typed = False
+
+            for attempt in range(12):
+                with STATE_LOCK:
+                    if BOT_STATE["stop_requested"]:
                         break
+
+                await capture_snap(page)
+
+                # Check if Google blocked anonymous access completely
+                body_txt = ""
+                try:
+                    body_txt = await page.inner_text("body")
                 except Exception:
                     pass
+
+                if "You can't join this call" in body_txt or "Sign in to join" in body_txt:
+                    with STATE_LOCK:
+                        BOT_STATE["status"] = "error"
+                        BOT_STATE["message"] = "Host blocked guests! Paste your Google Cookies in the app first."
+                    return
+
+                # 1. Dismiss permission/warning popups
+                for popup_text in [
+                    "Continue without microphone and camera",
+                    "Continue without microphone",
+                    "Allow microphone and camera",
+                    "Got it",
+                    "Dismiss"
+                ]:
+                    try:
+                        p_btn = page.locator(f"button:has-text('{popup_text}'), [role='button']:has-text('{popup_text}')").first
+                        if await p_btn.is_visible():
+                            await p_btn.click(force=True)
+                            await asyncio.sleep(1)
+                    except Exception:
+                        pass
+
+                # 2. Fill Custom Name if guest name box is visible
+                if not name_typed:
+                    try:
+                        name_input = page.locator("input[type='text'], input[placeholder*='name' i], input[aria-label*='name' i]").first
+                        if await name_input.is_visible():
+                            with STATE_LOCK:
+                                BOT_STATE["message"] = f"Typing name: {raw_name}..."
+                            await name_input.click(force=True)
+                            await asyncio.sleep(0.4)
+                            await name_input.fill("")
+                            await name_input.type(safe_name, delay=75)
+                            name_typed = True
+                            await asyncio.sleep(1)
+                    except Exception:
+                        pass
+
+                # 3. Search for Join / Ask to join button via Playwright + JS fallback
+                for btn_label in ["Ask to join", "Join now", "Switch here", "Join"]:
+                    try:
+                        btn = page.locator(
+                            f"button:has-text('{btn_label}'), [role='button']:has-text('{btn_label}'), span:has-text('{btn_label}')"
+                        ).first
+                        if await btn.is_visible():
+                            await btn.click(force=True)
+                            joined_clicked = True
+                            break
+                    except Exception:
+                        pass
+
+                if joined_clicked:
+                    break
+
+                await asyncio.sleep(3)
+
+            await capture_snap(page)
 
             if not joined_clicked:
                 with STATE_LOCK:
                     BOT_STATE["status"] = "error"
-                    BOT_STATE["message"] = "Could not find Join button (Check link or meeting status)."
+                    BOT_STATE["message"] = "Join button not found! Tap '📸 View Live Snapshot' to see what Google showed."
                 return
 
             with STATE_LOCK:
                 BOT_STATE["status"] = "in_class"
-                BOT_STATE["message"] = "In Class / Waiting Room (Mic & Cam OFF)."
+                BOT_STATE["message"] = "Active in Class / Waiting Room (Mic & Cam OFF)."
 
             elapsed = 0
             max_seconds = max_minutes * 60
@@ -239,6 +289,7 @@ async def meet_bot_worker(meet_url: str, raw_name: str, max_minutes: int, min_pa
 
                 await asyncio.sleep(10)
                 elapsed += 10
+                await capture_snap(page)
 
                 try:
                     body_text = await page.inner_text("body")
@@ -307,6 +358,13 @@ def health():
 def status():
     with STATE_LOCK:
         return jsonify(BOT_STATE)
+
+@app.route("/view", methods=["GET"])
+def view_snapshot():
+    """Live snapshot endpoint ending with /view so you can see what the bot sees."""
+    if LAST_SCREENSHOT:
+        return Response(LAST_SCREENSHOT, mimetype="image/jpeg")
+    return "<h3>No snapshot captured yet. Deploy the bot first!</h3>", 404
 
 @app.route("/join", methods=["POST", "GET"])
 def join_meeting():
