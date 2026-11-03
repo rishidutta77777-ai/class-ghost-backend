@@ -1,5 +1,4 @@
-fastapi
-uvicorn[standard]
-pydantic
-playwright
-gunicorn
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+playwright==1.49.1
