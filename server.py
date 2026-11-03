@@ -20,6 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Active session tracker: { session_id: { "browser": browser, "page": page, "status": "running" } }
 sessions: Dict[str, Dict[str, Any]] = {}
 
 class MeetingRequest(BaseModel):
@@ -64,35 +65,39 @@ async def stop_session(req: StopRequest):
 
 
 async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, Any]]):
-    print(f"[{session_id}] Starting runner worker for: {url}")
+    print(f"[{session_id}] Worker triggered for {url}")
+    browser = None
     try:
         async with async_playwright() as p:
-            print(f"[{session_id}] Launching Chromium...")
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
-                    "--disable-blink-features=AutomationControlled",
-                    "--deny-permission-prompts",
-                    "--mute-audio",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-features=AudioServiceSandbox,TranslateUI,WebRtcHideLocalIpsWithMdns",
-                    "--renderer-process-limit=1",
-                    "--js-flags=--max-old-space-size=96"
-                ]
-            )
+            print(f"[{session_id}] Attempting Chromium launch...")
+            try:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-software-rasterizer",
+                        "--disable-blink-features=AutomationControlled",
+                        "--deny-permission-prompts",
+                        "--mute-audio",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-features=AudioServiceSandbox,TranslateUI,WebRtcHideLocalIpsWithMdns",
+                        "--renderer-process-limit=1",
+                        "--js-flags=--max-old-space-size=96"
+                    ]
+                )
+                print(f"[{session_id}] Chromium launched successfully.")
+            except Exception as launch_err:
+                print(f"[{session_id}] FATAL: Browser launch failed: {launch_err}")
+                raise launch_err
 
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 permissions=[],
                 viewport={"width": 1280, "height": 720},
-                device_scale_factor=1,
-                color_scheme="dark",
                 locale="en-US",
                 timezone_id="Asia/Kolkata",
                 extra_http_headers={
@@ -103,19 +108,19 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
                 }
             )
 
-            # Sanitize and inject cookies
+            # Sanitize cookies strictly
             valid_cookies = []
             for c in raw_cookies:
                 try:
                     name_val = str(c.get("name", "")).strip()
                     val = str(c.get("value", "")).strip()
-                    if not name_val:
+                    if not name_val or not val:
                         continue
 
                     raw_domain = str(c.get("domain", ".google.com")).strip()
                     clean_domain = raw_domain if raw_domain.startswith(".") else f".{raw_domain}"
 
-                    cookie_entry = {
+                    entry = {
                         "name": name_val,
                         "value": val,
                         "domain": clean_domain,
@@ -127,21 +132,22 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
                     if isinstance(same_site, str):
                         s_lower = same_site.lower()
                         if s_lower in ["none", "no_restriction"]:
-                            cookie_entry["sameSite"] = "None"
+                            entry["sameSite"] = "None"
                         elif s_lower == "lax":
-                            cookie_entry["sameSite"] = "Lax"
+                            entry["sameSite"] = "Lax"
                         elif s_lower == "strict":
-                            cookie_entry["sameSite"] = "Strict"
+                            entry["sameSite"] = "Strict"
 
-                    valid_cookies.append(cookie_entry)
+                    valid_cookies.append(entry)
                 except Exception:
                     continue
 
-            try:
-                await context.add_cookies(valid_cookies)
-                print(f"[{session_id}] Loaded {len(valid_cookies)} cookies.")
-            except Exception as e:
-                print(f"[{session_id}] Cookie injection issue: {e}")
+            if valid_cookies:
+                try:
+                    await context.add_cookies(valid_cookies)
+                    print(f"[{session_id}] Injected {len(valid_cookies)} cookies successfully.")
+                except Exception as cookie_err:
+                    print(f"[{session_id}] Warning: add_cookies issue: {cookie_err}")
             finally:
                 del raw_cookies
                 del valid_cookies
@@ -167,7 +173,7 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
                 });
             """)
 
-            # Block heavy assets to protect 512MB RAM
+            # Route blocker for images and fonts to preserve RAM
             async def intercept_route(route):
                 if route.request.resource_type in ["image", "font"]:
                     await route.abort()
@@ -177,14 +183,18 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
             await page.route("**/*", intercept_route)
             sessions[session_id] = {"browser": browser, "page": page, "status": "running"}
 
-            # Navigate to meeting
-            print(f"[{session_id}] Opening {url}...")
+            # Save initial snapshot right away
+            try:
+                await page.screenshot(path="last_view.png")
+            except Exception:
+                pass
+
+            print(f"[{session_id}] Loading meeting page: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-            # Pre-join handler
+            # Lobby handling
             joined = False
             for attempt in range(30):
-                # Take early snapshots so /view works immediately
                 try:
                     await page.screenshot(path="last_view.png")
                 except Exception:
@@ -199,7 +209,7 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
                         except Exception:
                             pass
 
-                # Mute shortcuts
+                # Mute mic and camera using keyboard shortcuts
                 try:
                     await page.keyboard.press("Control+d")
                     await page.keyboard.press("Control+e")
@@ -219,7 +229,7 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
                     btn = page.locator(selector)
                     if await btn.count() > 0:
                         if await btn.first.is_visible() and await btn.first.is_enabled():
-                            print(f"[{session_id}] Clicking join button...")
+                            print(f"[{session_id}] Clicking {selector}")
                             await asyncio.sleep(1)
                             await btn.first.click()
                             joined = True
@@ -227,12 +237,11 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
 
                 if joined:
                     break
-
                 await asyncio.sleep(2)
 
             await asyncio.sleep(8)
 
-            # Strip WebRTC streams to keep RAM low
+            # Cut off WebRTC streams to prevent memory escalation
             try:
                 await page.evaluate("""
                     () => {
@@ -252,7 +261,7 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
             except Exception:
                 pass
 
-            # Update confirmation snapshot inside room
+            # Capture confirmation snapshot inside room
             try:
                 await page.screenshot(path="last_view.png")
             except Exception:
@@ -260,7 +269,7 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
 
             gc.collect()
 
-            # Keep-alive loop
+            # Keep-alive loop inside meeting
             while session_id in sessions and sessions[session_id]["status"] == "running":
                 try:
                     evicted = await page.locator('text="You left the meeting", text="You were removed"').count()
@@ -274,15 +283,16 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
                 gc.collect()
 
     except Exception as e:
-        print(f"[{session_id}] Critical runner failure: {e}")
+        print(f"[{session_id}] Error in worker execution: {e}")
         traceback.print_exc()
     finally:
+        print(f"[{session_id}] Cleaning up session.")
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
         if session_id in sessions:
-            if "browser" in sessions[session_id]:
-                try:
-                    await sessions[session_id]["browser"].close()
-                except Exception:
-                    pass
             sessions[session_id]["status"] = "ended"
         gc.collect()
 
