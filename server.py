@@ -2,6 +2,7 @@ import asyncio
 import os
 import uuid
 import gc
+import subprocess
 import traceback
 from typing import List, Dict, Any
 from fastapi import FastAPI, BackgroundTasks
@@ -31,6 +32,25 @@ class StopRequest(BaseModel):
     session_id: str
 
 
+def trigger_codespace_shutdown():
+    """If running inside GitHub Codespaces, stop the VM automatically to save free hours."""
+    if os.environ.get("CODESPACES") == "true":
+        print("[System] Detected GitHub Codespace. Initiating auto-shutdown in 3 seconds...")
+        asyncio.create_task(_async_codespace_stop())
+
+
+async def _async_codespace_stop():
+    await asyncio.sleep(3)
+    codespace_name = os.environ.get("CODESPACE_NAME", "")
+    try:
+        if codespace_name:
+            subprocess.run(["gh", "codespace", "stop", "-c", codespace_name], check=False)
+        else:
+            subprocess.run(["gh", "codespace", "stop"], check=False)
+    except Exception as e:
+        print(f"[System] Codespace stop error: {e}")
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -39,7 +59,11 @@ async def health():
 @app.get("/view")
 async def view_screen():
     if os.path.exists("last_view.png"):
-        return FileResponse("last_view.png", media_type="image/png")
+        return FileResponse(
+            "last_view.png", 
+            media_type="image/png",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+        )
     return Response(content="No snapshot captured yet", media_type="text/plain")
 
 
@@ -60,11 +84,12 @@ async def stop_session(req: StopRequest):
             await sess["browser"].close()
         except Exception:
             pass
+    trigger_codespace_shutdown()
     return {"status": "terminated"}
 
 
 async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, Any]]):
-    print(f"[{session_id}] Worker starting for {url}")
+    print(f"[{session_id}] Starting runner worker for: {url}")
     browser = None
     try:
         async with async_playwright() as p:
@@ -77,7 +102,7 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
                     "--disable-gpu",
                     "--disable-software-rasterizer",
                     "--disable-blink-features=AutomationControlled",
-                    "--deny-permission-prompts",
+                    "--window-size=1280,720",
                     "--mute-audio",
                     "--no-first-run",
                     "--no-default-browser-check",
@@ -89,13 +114,19 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
 
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                permissions=[],
-                viewport={"width": 800, "height": 600},
+                viewport={"width": 1280, "height": 720},
+                device_scale_factor=1,
                 locale="en-US",
-                timezone_id="Asia/Kolkata"
+                timezone_id="Asia/Kolkata",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"Windows"'
+                }
             )
 
-            # Sanitize cookies
+            # Sanitize and load cookies
             valid_cookies = []
             for c in raw_cookies:
                 try:
@@ -134,7 +165,7 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
                     await context.add_cookies(valid_cookies)
                     print(f"[{session_id}] Injected {len(valid_cookies)} cookies.")
                 except Exception as ce:
-                    print(f"[{session_id}] Cookie error: {ce}")
+                    print(f"[{session_id}] Cookie inject error: {ce}")
 
             del raw_cookies
             del valid_cookies
@@ -142,33 +173,30 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
 
             page = await context.new_page()
 
-            # Anti-bot stealth + Disabling incoming WebRTC video decoding to protect 512MB RAM
+            # Anti-detection stealth & WebRTC suppression
             await page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 window.chrome = { runtime: {} };
-                
-                // Block incoming WebRTC media tracks at the browser protocol level
+                Object.defineProperty(window, 'outerWidth', { get: () => 1280 });
+                Object.defineProperty(window, 'outerHeight', { get: () => 720 });
                 if (window.RTCPeerConnection) {
-                    const orig = RTCPeerConnection.prototype.addTrack;
                     RTCPeerConnection.prototype.addTrack = function() { return null; };
                 }
             """)
 
             sessions[session_id] = {"browser": browser, "page": page, "status": "running"}
 
-            print(f"[{session_id}] Navigating to {url}...")
+            print(f"[{session_id}] Opening {url}...")
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-            # Pre-join loop
+            # Lobby navigation
             joined = False
             for _ in range(30):
-                # Save snapshot so /view works
                 try:
                     await page.screenshot(path="last_view.png")
                 except Exception:
                     pass
 
-                # Dismiss popups
                 for text in ["Got it", "Dismiss", "I agree", "Accept all", "Continue without microphone", "Continue without camera"]:
                     dismiss = page.locator(f'button:has-text("{text}")')
                     if await dismiss.count() > 0:
@@ -177,14 +205,12 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
                         except Exception:
                             pass
 
-                # Mute mic and cam shortcuts
                 try:
                     await page.keyboard.press("Control+d")
                     await page.keyboard.press("Control+e")
                 except Exception:
                     pass
 
-                # Join buttons
                 for selector in [
                     'button:has-text("Ask to join")',
                     'button:has-text("Join now")',
@@ -206,7 +232,6 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
 
             await asyncio.sleep(8)
 
-            # Mute all media elements inside the DOM
             try:
                 await page.evaluate("""
                     () => {
@@ -223,7 +248,6 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
             except Exception:
                 pass
 
-            # Snapshot inside class
             try:
                 await page.screenshot(path="last_view.png")
             except Exception:
@@ -231,24 +255,24 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
 
             gc.collect()
 
-            # Zero-load keep-alive loop
+            # Keep-alive loop
             while session_id in sessions and sessions[session_id]["status"] == "running":
                 try:
                     evicted = await page.locator('text="You left the meeting", text="You were removed"').count()
                     if evicted > 0:
-                        print(f"[{session_id}] Left meeting or evicted.")
+                        print(f"[{session_id}] Meeting ended by host.")
                         break
                 except Exception:
                     pass
 
-                await asyncio.sleep(25)
+                await asyncio.sleep(20)
                 gc.collect()
 
     except Exception as e:
-        print(f"[{session_id}] Worker error: {e}")
+        print(f"[{session_id}] Runner error: {e}")
         traceback.print_exc()
     finally:
-        print(f"[{session_id}] Session terminated. Cleaning up...")
+        print(f"[{session_id}] Cleaning up session.")
         if browser:
             try:
                 await browser.close()
@@ -257,6 +281,7 @@ async def run_bot_worker(session_id: str, url: str, raw_cookies: List[Dict[str, 
         if session_id in sessions:
             sessions[session_id]["status"] = "ended"
         gc.collect()
+        trigger_codespace_shutdown()
 
 
 @app.post("/start")
