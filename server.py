@@ -1,5 +1,6 @@
 import asyncio
 import os
+import urllib.request
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,23 +27,45 @@ bot_state = {
     "context": None,
     "page": None,
     "is_running": False,
-    "heartbeat_task": None
+    "anti_idle_task": None,
+    "codespace_keepalive_task": None
 }
 
-async def anti_idle_loop():
-    """Keeps the session active in Google Meet so it never gets kicked for inactivity."""
+async def codespace_keepalive_loop():
+    """Pings the public tunnel every 2 minutes so Codespaces does not suspend the VM."""
     while bot_state["is_running"]:
+        await asyncio.sleep(120)
         try:
-            await asyncio.sleep(60)
+            # Self-ping the local backend port to generate tunnel and process activity
+            req = urllib.request.Request("http://127.0.0.1:8000/health", headers={"User-Agent": "KeepAlive"})
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass
+
+async def meet_anti_idle_loop():
+    """Interacts with Google Meet so the session is never kicked for inactivity."""
+    while bot_state["is_running"]:
+        await asyncio.sleep(45)
+        try:
             page = bot_state.get("page")
             if page and not page.is_closed():
-                # 1. Subtle interaction to prevent Google Meet idle timeout
+                # 1. Micro-interaction: nudge mouse cursor and send keypress
+                await page.mouse.move(100, 100)
                 await page.keyboard.press("Shift")
                 
-                # 2. Check for & dismiss "Are you still there?" or "Return to call" prompts
-                stay_btn = page.locator("button:has-text('Yes'), button:has-text('Stay in call'), button:has-text('Rejoin')")
-                if await stay_btn.count() > 0:
-                    await stay_btn.first.click()
+                # 2. Automatically dismiss 'Are you still there?' or 'Return to call' popups
+                dismiss_locators = [
+                    "button:has-text('Yes')",
+                    "button:has-text('Stay in call')",
+                    "button:has-text('Rejoin')",
+                    "button:has-text('Return to call')",
+                    "div[role='button']:has-text('Continue')"
+                ]
+                for selector in dismiss_locators:
+                    btn = page.locator(selector)
+                    if await btn.count() > 0:
+                        await btn.first.click()
+                        break
         except Exception:
             pass
 
@@ -57,10 +80,10 @@ async def view_snapshot():
         raise HTTPException(status_code=400, detail="Bot is not active")
     
     try:
-        # Capture fresh screenshot directly into memory without disk caching
-        img_bytes = await page.screenshot(type="jpeg", quality=60)
+        # Capture raw frame buffer directly to memory without disk cache
+        img_bytes = await page.screenshot(type="jpeg", quality=65)
         return Response(
-            content=img_bytes, 
+            content=img_bytes,
             media_type="image/jpeg",
             headers={
                 "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -85,7 +108,10 @@ async def start_bot(req: JoinRequest):
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--use-fake-ui-for-media-stream",
-                "--use-fake-device-for-media-stream"
+                "--use-fake-device-for-media-stream",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding"
             ]
         )
         context = await browser.new_context(
@@ -94,7 +120,6 @@ async def start_bot(req: JoinRequest):
             viewport={"width": 1280, "height": 720}
         )
         
-        # Format and insert cookies cleanly
         formatted_cookies = []
         for c in req.cookies:
             cookie = {
@@ -110,26 +135,25 @@ async def start_bot(req: JoinRequest):
         await context.add_cookies(formatted_cookies)
         page = await context.new_page()
 
-        # Navigate to meeting
         await page.goto(req.meeting_url, wait_until="networkidle", timeout=60000)
         await asyncio.sleep(4)
 
-        # Mute Mic and Camera before entering
+        # Mute audio & video
         try:
-            mic_btn = page.locator("div[role='button'][aria-label*='microphone' i], div[role='button'][data-is-muted]")
-            if await mic_btn.count() > 0:
-                await mic_btn.first.click()
+            mic = page.locator("div[role='button'][aria-label*='microphone' i], div[role='button'][data-is-muted]")
+            if await mic.count() > 0:
+                await mic.first.click()
         except Exception:
             pass
 
         try:
-            cam_btn = page.locator("div[role='button'][aria-label*='camera' i]")
-            if await cam_btn.count() > 0:
-                await cam_btn.first.click()
+            cam = page.locator("div[role='button'][aria-label*='camera' i]")
+            if await cam.count() > 0:
+                await cam.first.click()
         except Exception:
             pass
 
-        # Click Join or Ask to Join
+        # Join room
         join_btn = page.locator("button:has-text('Ask to join'), button:has-text('Join now'), span:has-text('Ask to join'), span:has-text('Join now')")
         if await join_btn.count() > 0:
             await join_btn.first.click()
@@ -140,8 +164,9 @@ async def start_bot(req: JoinRequest):
         bot_state["page"] = page
         bot_state["is_running"] = True
         
-        # Start anti-idle heartbeat task
-        bot_state["heartbeat_task"] = asyncio.create_task(anti_idle_loop())
+        # Start persistent background workers
+        bot_state["anti_idle_task"] = asyncio.create_task(meet_anti_idle_loop())
+        bot_state["codespace_keepalive_task"] = asyncio.create_task(codespace_keepalive_loop())
 
         return {"status": "joined"}
     except Exception as e:
@@ -151,12 +176,14 @@ async def start_bot(req: JoinRequest):
 @app.post("/stop")
 async def stop_bot():
     bot_state["is_running"] = False
-    if bot_state.get("heartbeat_task"):
-        bot_state["heartbeat_task"].cancel()
+    
+    if bot_state.get("anti_idle_task"):
+        bot_state["anti_idle_task"].cancel()
+    if bot_state.get("codespace_keepalive_task"):
+        bot_state["codespace_keepalive_task"].cancel()
 
     try:
         if bot_state.get("page") and not bot_state["page"].is_closed():
-            # Click end call button if present
             leave_btn = bot_state["page"].locator("button[aria-label*='Leave' i]")
             if await leave_btn.count() > 0:
                 await leave_btn.first.click()
@@ -170,7 +197,6 @@ async def stop_bot():
     except Exception:
         pass
     finally:
-        # Automatic VM stop after stopping bot
         os.system("gh codespace stop -c $CODESPACE_NAME &")
 
     return {"status": "stopped"}
