@@ -33,27 +33,27 @@ bot_state = {
 }
 
 async def watchdog_and_anti_kick_loop():
-    """Continuously monitors call state, generates real activity, and auto-rejoins if disconnected."""
+    """Monitors meeting room state every 10 seconds and aggressively auto-rejoins if disconnected."""
     while bot_state["is_running"]:
-        await asyncio.sleep(20)
+        await asyncio.sleep(10)
         page = bot_state.get("page")
         if not page or page.is_closed():
             continue
 
         try:
             curr_url = page.url
+            target_code = bot_state["meeting_url"].rstrip("/").split("/")[-1]
 
-            # 1. Check if Google Meet kicked the bot to a landing or post-call page
-            if "meet.google.com" in curr_url and not any(code in curr_url for code in bot_state["meeting_url"].split("/")[-1:]):
-                # If diverted away from the meeting room, force reload into the room
+            # 1. If Meet kicked the bot back to landing/home, force re-entry immediately
+            if "meet.google.com" in curr_url and target_code not in curr_url:
                 await page.goto(bot_state["meeting_url"], wait_until="networkidle", timeout=30000)
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
                 join_btn = page.locator("button:has-text('Ask to join'), button:has-text('Join now'), span:has-text('Join now')")
                 if await join_btn.count() > 0:
                     await join_btn.first.click()
                 continue
 
-            # 2. Click any modal dismiss buttons ('Still there?', 'Rejoin', 'Return to call')
+            # 2. Click any dismissal buttons ('Still there?', 'Rejoin', 'Return to call')
             dismiss_selectors = [
                 "button:has-text('Rejoin')",
                 "button:has-text('Return to call')",
@@ -67,17 +67,20 @@ async def watchdog_and_anti_kick_loop():
                     await btn.first.click()
                     await asyncio.sleep(1)
 
-            # 3. Simulate human interaction (DOM cursor movement and focus event)
-            await page.mouse.move(200, 200)
-            await page.evaluate("window.dispatchEvent(new Event('mousemove')); window.dispatchEvent(new Event('focus'));")
-
+            # 3. Simulate hardware user activity directly on the page window
+            await page.keyboard.press("Shift")
+            await page.mouse.move(150, 150)
+            await page.evaluate("""
+                window.dispatchEvent(new Event('mousemove'));
+                window.dispatchEvent(new Event('focus'));
+            """)
         except Exception:
             pass
 
 async def codespace_keepalive():
     """Keeps Codespace VM network tunnel active so GitHub does not suspend the machine."""
     while bot_state["is_running"]:
-        await asyncio.sleep(120)
+        await asyncio.sleep(100)
         try:
             req = urllib.request.Request("http://127.0.0.1:8000/health", headers={"User-Agent": "WatchdogKeepAlive"})
             urllib.request.urlopen(req, timeout=5)
@@ -121,7 +124,7 @@ async def start_bot(req: JoinRequest):
         bot_state["meeting_url"] = req.meeting_url
         pw = await async_playwright().start()
         
-        # Chromium launched with fake synthetic audio streaming hardware
+        # Chromium launched with real virtual microphone hardware devices
         browser = await pw.chromium.launch(
             headless=True,
             args=[
@@ -157,6 +160,21 @@ async def start_bot(req: JoinRequest):
         await context.add_cookies(formatted_cookies)
         page = await context.new_page()
 
+        # Inaudible WebRTC audio generator: prevents Google Meet 30-min idle drops
+        await page.add_init_script("""
+            window.addEventListener('load', () => {
+                try {
+                    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    const osc = audioCtx.createOscillator();
+                    const gain = audioCtx.createGain();
+                    gain.gain.value = 0.0001; // Silent tone to avoid making noise in class
+                    osc.connect(gain);
+                    gain.connect(audioCtx.destination);
+                    osc.start();
+                } catch(e) {}
+            });
+        """)
+
         await page.goto(req.meeting_url, wait_until="networkidle", timeout=60000)
         await asyncio.sleep(4)
 
@@ -168,15 +186,15 @@ async def start_bot(req: JoinRequest):
         except Exception:
             pass
 
-        # Ensure mic button is toggled to generate media pipeline connection
+        # Dismiss initial 'Microphone not found' popup if it appears
         try:
-            mic = page.locator("div[role='button'][aria-label*='microphone' i]")
-            if await mic.count() > 0:
-                await mic.first.click()
+            close_popup = page.locator("div[role='dialog'] button[aria-label*='Close' i], button:has-text('Dismiss')")
+            if await close_popup.count() > 0:
+                await close_popup.first.click()
         except Exception:
             pass
 
-        # Join room
+        # Join the meeting
         join_btn = page.locator("button:has-text('Ask to join'), button:has-text('Join now'), span:has-text('Ask to join'), span:has-text('Join now')")
         if await join_btn.count() > 0:
             await join_btn.first.click()
