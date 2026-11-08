@@ -27,51 +27,70 @@ bot_state = {
     "context": None,
     "page": None,
     "is_running": False,
-    "anti_idle_task": None,
-    "codespace_keepalive_task": None
+    "meeting_url": "",
+    "watchdog_task": None,
+    "keepalive_task": None
 }
 
-async def codespace_keepalive_loop():
-    """Pings the public tunnel every 2 minutes so Codespaces does not suspend the VM."""
+async def watchdog_and_anti_kick_loop():
+    """Continuously monitors call state, generates real activity, and auto-rejoins if disconnected."""
     while bot_state["is_running"]:
-        await asyncio.sleep(120)
+        await asyncio.sleep(20)
+        page = bot_state.get("page")
+        if not page or page.is_closed():
+            continue
+
         try:
-            # Self-ping the local backend port to generate tunnel and process activity
-            req = urllib.request.Request("http://127.0.0.1:8000/health", headers={"User-Agent": "KeepAlive"})
-            urllib.request.urlopen(req, timeout=5)
+            curr_url = page.url
+
+            # 1. Check if Google Meet kicked the bot to a landing or post-call page
+            if "meet.google.com" in curr_url and not any(code in curr_url for code in bot_state["meeting_url"].split("/")[-1:]):
+                # If diverted away from the meeting room, force reload into the room
+                await page.goto(bot_state["meeting_url"], wait_until="networkidle", timeout=30000)
+                await asyncio.sleep(3)
+                join_btn = page.locator("button:has-text('Ask to join'), button:has-text('Join now'), span:has-text('Join now')")
+                if await join_btn.count() > 0:
+                    await join_btn.first.click()
+                continue
+
+            # 2. Click any modal dismiss buttons ('Still there?', 'Rejoin', 'Return to call')
+            dismiss_selectors = [
+                "button:has-text('Rejoin')",
+                "button:has-text('Return to call')",
+                "button:has-text('Stay in call')",
+                "button:has-text('Yes')",
+                "div[role='button']:has-text('Continue')"
+            ]
+            for sel in dismiss_selectors:
+                btn = page.locator(sel)
+                if await btn.count() > 0:
+                    await btn.first.click()
+                    await asyncio.sleep(1)
+
+            # 3. Simulate human interaction (DOM cursor movement and focus event)
+            await page.mouse.move(200, 200)
+            await page.evaluate("window.dispatchEvent(new Event('mousemove')); window.dispatchEvent(new Event('focus'));")
+
         except Exception:
             pass
 
-async def meet_anti_idle_loop():
-    """Interacts with Google Meet so the session is never kicked for inactivity."""
+async def codespace_keepalive():
+    """Keeps Codespace VM network tunnel active so GitHub does not suspend the machine."""
     while bot_state["is_running"]:
-        await asyncio.sleep(45)
+        await asyncio.sleep(120)
         try:
-            page = bot_state.get("page")
-            if page and not page.is_closed():
-                # 1. Micro-interaction: nudge mouse cursor and send keypress
-                await page.mouse.move(100, 100)
-                await page.keyboard.press("Shift")
-                
-                # 2. Automatically dismiss 'Are you still there?' or 'Return to call' popups
-                dismiss_locators = [
-                    "button:has-text('Yes')",
-                    "button:has-text('Stay in call')",
-                    "button:has-text('Rejoin')",
-                    "button:has-text('Return to call')",
-                    "div[role='button']:has-text('Continue')"
-                ]
-                for selector in dismiss_locators:
-                    btn = page.locator(selector)
-                    if await btn.count() > 0:
-                        await btn.first.click()
-                        break
+            req = urllib.request.Request("http://127.0.0.1:8000/health", headers={"User-Agent": "WatchdogKeepAlive"})
+            urllib.request.urlopen(req, timeout=5)
         except Exception:
             pass
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "bot_running": bot_state["is_running"]}
+    in_call = False
+    page = bot_state.get("page")
+    if page and not page.is_closed() and bot_state["is_running"]:
+        in_call = True
+    return {"status": "ok", "bot_running": in_call}
 
 @app.get("/view")
 async def view_snapshot():
@@ -80,7 +99,6 @@ async def view_snapshot():
         raise HTTPException(status_code=400, detail="Bot is not active")
     
     try:
-        # Capture raw frame buffer directly to memory without disk cache
         img_bytes = await page.screenshot(type="jpeg", quality=65)
         return Response(
             content=img_bytes,
@@ -100,7 +118,10 @@ async def start_bot(req: JoinRequest):
         return {"status": "already_running"}
 
     try:
+        bot_state["meeting_url"] = req.meeting_url
         pw = await async_playwright().start()
+        
+        # Chromium launched with fake synthetic audio streaming hardware
         browser = await pw.chromium.launch(
             headless=True,
             args=[
@@ -109,6 +130,7 @@ async def start_bot(req: JoinRequest):
                 "--disable-blink-features=AutomationControlled",
                 "--use-fake-ui-for-media-stream",
                 "--use-fake-device-for-media-stream",
+                "--autoplay-policy=no-user-gesture-required",
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding"
@@ -138,18 +160,19 @@ async def start_bot(req: JoinRequest):
         await page.goto(req.meeting_url, wait_until="networkidle", timeout=60000)
         await asyncio.sleep(4)
 
-        # Mute audio & video
-        try:
-            mic = page.locator("div[role='button'][aria-label*='microphone' i], div[role='button'][data-is-muted]")
-            if await mic.count() > 0:
-                await mic.first.click()
-        except Exception:
-            pass
-
+        # Mute camera
         try:
             cam = page.locator("div[role='button'][aria-label*='camera' i]")
             if await cam.count() > 0:
                 await cam.first.click()
+        except Exception:
+            pass
+
+        # Ensure mic button is toggled to generate media pipeline connection
+        try:
+            mic = page.locator("div[role='button'][aria-label*='microphone' i]")
+            if await mic.count() > 0:
+                await mic.first.click()
         except Exception:
             pass
 
@@ -164,9 +187,9 @@ async def start_bot(req: JoinRequest):
         bot_state["page"] = page
         bot_state["is_running"] = True
         
-        # Start persistent background workers
-        bot_state["anti_idle_task"] = asyncio.create_task(meet_anti_idle_loop())
-        bot_state["codespace_keepalive_task"] = asyncio.create_task(codespace_keepalive_loop())
+        # Start persistent Watchdog and VM keepalive
+        bot_state["watchdog_task"] = asyncio.create_task(watchdog_and_anti_kick_loop())
+        bot_state["keepalive_task"] = asyncio.create_task(codespace_keepalive())
 
         return {"status": "joined"}
     except Exception as e:
@@ -177,10 +200,10 @@ async def start_bot(req: JoinRequest):
 async def stop_bot():
     bot_state["is_running"] = False
     
-    if bot_state.get("anti_idle_task"):
-        bot_state["anti_idle_task"].cancel()
-    if bot_state.get("codespace_keepalive_task"):
-        bot_state["codespace_keepalive_task"].cancel()
+    if bot_state.get("watchdog_task"):
+        bot_state["watchdog_task"].cancel()
+    if bot_state.get("keepalive_task"):
+        bot_state["keepalive_task"].cancel()
 
     try:
         if bot_state.get("page") and not bot_state["page"].is_closed():
